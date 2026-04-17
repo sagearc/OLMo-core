@@ -110,8 +110,12 @@ def _get_torch_version() -> Tuple[int, int]:
 
 def _get_cuda_version() -> Optional[Tuple[int, int]]:
     if torch.cuda.is_available() and torch.cuda.is_initialized():
-        assert torch.version.cuda is not None
-        version = parse_version(torch.version.cuda)
+        if torch.version.cuda is not None:
+            version = parse_version(torch.version.cuda)
+        elif torch.version.hip is not None:
+            version = parse_version(torch.version.hip)
+        else:
+            return None
         return (version.major, version.minor)
     else:
         return None
