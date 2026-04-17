@@ -232,7 +232,30 @@ class MoERouter(nn.Module):
         else:
             self.register_buffer("score_bias", None)
 
-        # NOTE: we don't use buffers for t hese because we don't want FSDP to manage them, and we
+        # EMA state — registered as buffers so they get checkpointed by the sharded
+        # checkpointer (mirrors `score_bias`). Buffer registration is safe here because
+        # the EMA is only *read* in forward; updates happen in `post_batch`, outside any
+        # torch.compile traced region. Initialized to zero so Adam-style bias correction
+        # (1 / (1 - α^t)) yields unbiased mean / E[X²] estimates from step 1 onwards.
+        if self.ema_zscore_normalize:
+            self.register_buffer(
+                "_ema_mean",
+                torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
+            )
+            self.register_buffer(
+                "_ema_sq",
+                torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
+            )
+            self.register_buffer(
+                "_ema_step_count",
+                torch.zeros((), dtype=torch.long, device=init_device),
+            )
+        else:
+            self.register_buffer("_ema_mean", None)
+            self.register_buffer("_ema_sq", None)
+            self.register_buffer("_ema_step_count", None)
+
+        # NOTE: we don't use buffers for these because we don't want FSDP to manage them, and we
         # don't use a BufferCache because `torch.compile()` doesn't handle that well when we're modifying
         # values in the cache.
         self._batch_size_per_expert = hide_from_torch(
@@ -242,11 +265,11 @@ class MoERouter(nn.Module):
         self._load_balancing_loss: Optional[_HiddenTensor] = None
         self._z_loss: Optional[_HiddenTensor] = None
         self._seq_aux_loss: Optional[_HiddenTensor] = None
-        # EMA state. Plain attributes (not buffers) by design: the sharded checkpointer
-        # ignores buffers, and registering as buffers triggers FSDP bf16 buffer-dtype casts.
-        # Lazily initialized in forward() so they land on the right device.
-        self._ema_mean: Optional[torch.Tensor] = None
-        self._ema_sq: Optional[torch.Tensor] = None
+        # Per-step EMA accumulators (raw sums, not means). Reset in `post_batch` after each
+        # optimizer step. Hidden from torch so FSDP doesn't try to manage them.
+        self._ema_logit_sum_accum: Optional[_HiddenTensor] = None
+        self._ema_logit_sq_sum_accum: Optional[_HiddenTensor] = None
+        self._ema_token_count_accum: int = 0
 
     def reset_parameters(self):
         self._batch_size_per_expert = hide_from_torch(
@@ -271,8 +294,14 @@ class MoERouter(nn.Module):
             self._seq_aux_loss = hide_from_torch(torch.zeros([], device=self.device))
 
         if self.ema_zscore_normalize:
-            self._ema_mean = None
-            self._ema_sq = None
+            assert self._ema_mean is not None and self._ema_sq is not None
+            assert self._ema_step_count is not None
+            cast(torch.Tensor, self._ema_mean).zero_()
+            cast(torch.Tensor, self._ema_sq).zero_()
+            cast(torch.Tensor, self._ema_step_count).zero_()
+            self._ema_logit_sum_accum = None
+            self._ema_logit_sq_sum_accum = None
+            self._ema_token_count_accum = 0
 
     @property
     def device(self) -> torch.device:
@@ -354,65 +383,128 @@ class MoERouter(nn.Module):
 
     @torch.no_grad()
     def post_batch(self, dry_run: bool = False):
-        if self.bias_gamma is None or not self.training:
+        if not self.training:
             return
 
-        assert self.score_bias is not None
-        assert self.score_bias_batch_size_per_expert is not None
-        score_bias = cast(torch.Tensor, self.score_bias)
-        batch_size_per_expert = self.score_bias_batch_size_per_expert
+        # ---- DeepSeek bias-rule update --------------------------------------------------
+        if self.bias_gamma is not None:
+            assert self.score_bias is not None
+            assert self.score_bias_batch_size_per_expert is not None
+            score_bias = cast(torch.Tensor, self.score_bias)
+            batch_size_per_expert = self.score_bias_batch_size_per_expert
 
-        # Maybe reduce across the process group.
-        if is_distributed():
-            dist.all_reduce(batch_size_per_expert, group=self.group)
+            # Maybe reduce across the process group.
+            if is_distributed():
+                dist.all_reduce(batch_size_per_expert, group=self.group)
 
-        ideal_batch_size_per_expert = batch_size_per_expert.mean(
-            dim=0, keepdim=True, dtype=torch.float32
-        )
-        bias_delta = self.bias_gamma * (ideal_batch_size_per_expert - batch_size_per_expert).sign()
-        # NOTE: have to be careful here to manage the case where `score_bias` is a DTensor.
-        bias_delta = distribute_like(score_bias, bias_delta)
+            ideal_batch_size_per_expert = batch_size_per_expert.mean(
+                dim=0, keepdim=True, dtype=torch.float32
+            )
+            bias_delta = (
+                self.bias_gamma * (ideal_batch_size_per_expert - batch_size_per_expert).sign()
+            )
+            # NOTE: have to be careful here to manage the case where `score_bias` is a DTensor.
+            bias_delta = distribute_like(score_bias, bias_delta)
 
-        if not dry_run:
-            get_local_tensor(score_bias).add_(get_local_tensor(bias_delta))
+            if not dry_run:
+                get_local_tensor(score_bias).add_(get_local_tensor(bias_delta))
 
-        # Reset the accumulator.
-        batch_size_per_expert.zero_()
+            # Reset the accumulator.
+            batch_size_per_expert.zero_()
+
+        # ---- EMA z-score per-step update ------------------------------------------------
+        if self.ema_zscore_normalize and self._ema_logit_sum_accum is not None:
+            assert self._ema_mean is not None and self._ema_sq is not None
+            assert self._ema_step_count is not None
+            assert self._ema_logit_sq_sum_accum is not None
+            ema_mean = cast(torch.Tensor, self._ema_mean)
+            ema_sq = cast(torch.Tensor, self._ema_sq)
+            ema_step = cast(torch.Tensor, self._ema_step_count)
+            local_sum = unhide_from_torch(self._ema_logit_sum_accum)
+            local_sq = unhide_from_torch(self._ema_logit_sq_sum_accum)
+            local_count = torch.tensor(
+                float(self._ema_token_count_accum), dtype=torch.float32, device=local_sum.device
+            )
+
+            # Reduce SUMS and COUNT (not means) to get exact global mean under uneven
+            # per-rank token counts.
+            if is_distributed():
+                dist.all_reduce(local_sum, group=self.group)
+                dist.all_reduce(local_sq, group=self.group)
+                dist.all_reduce(local_count, group=self.group)
+
+            global_mean = local_sum / local_count
+            global_sq = local_sq / local_count
+
+            if not dry_run:
+                alpha = self.ema_zscore_alpha
+                ema_mean.mul_(alpha).add_(global_mean, alpha=1.0 - alpha)
+                ema_sq.mul_(alpha).add_(global_sq, alpha=1.0 - alpha)
+                ema_step.add_(1)  # tracks t for Adam-style bias correction in forward
+
+            # Reset accumulators whether or not we applied the update — never leak.
+            self._ema_logit_sum_accum = None
+            self._ema_logit_sq_sum_accum = None
+            self._ema_token_count_accum = 0
 
     def _apply_ema_zscore(self, logits: torch.Tensor) -> torch.Tensor:
         """
-        Z-normalize ``logits`` per expert using stale EMA mean / E[X²], then update the EMA
-        with the current logits (training only). Gradient flows through ``logits`` only.
-        """
-        num_experts = logits.shape[-1]
-        if self._ema_mean is None or self._ema_mean.device != logits.device:
-            self._ema_mean = torch.zeros(num_experts, dtype=torch.float32, device=logits.device)
-            self._ema_sq = torch.ones(num_experts, dtype=torch.float32, device=logits.device)
-        assert self._ema_sq is not None
+        Z-normalize ``logits`` per expert using the EMA snapshot from the previous optimizer
+        step, then accumulate raw stats (sum, sum-of-squares, token count) so that
+        :meth:`post_batch` can apply a single EMA update per step. Gradient flows through
+        ``logits`` only — EMA buffers and accumulators are detached.
 
-        ema_std = (self._ema_sq - self._ema_mean.pow(2)).clamp(min=1e-8).sqrt()
-        normalized = (logits - self._ema_mean) / ema_std
+        The EMA snapshot is constant across all microbatches within a step, so all
+        microbatches see identical ``μ``, ``σ``. This makes the per-step EMA decay
+        unambiguous (one ``α``-update per optimizer step, not per microbatch).
+
+        Adam-style bias correction (``/ (1 - α^t)``) is applied so that the EMA gives
+        unbiased mean / ``E[X²]`` estimates from step 1 onwards, instead of taking
+        ~``1/(1-α)`` steps to ramp up from the zero init.
+
+        Step ``t = 0`` (no stats yet) returns ``logits`` unchanged — the very first
+        forward sees raw logits, which is acceptable for one batch and avoids
+        normalizing by an undefined std.
+        """
+        assert self._ema_mean is not None and self._ema_sq is not None
+        assert self._ema_step_count is not None
+        ema_mean = cast(torch.Tensor, self._ema_mean)
+        ema_sq = cast(torch.Tensor, self._ema_sq)
+        step = int(cast(torch.Tensor, self._ema_step_count).item())
+        num_experts = logits.shape[-1]
+
+        if step == 0:
+            normalized = logits
+        else:
+            bc = 1.0 - (self.ema_zscore_alpha**step)
+            mean_hat = ema_mean / bc
+            sq_hat = ema_sq / bc
+            # Std floor of 1e-2 (clamp on var = 1e-4) keeps `(logits - μ) / σ` from
+            # blowing up to Inf under bf16 if the EMA variance ever collapses (e.g.
+            # immediately post-checkpoint-load before stats refill, or transient
+            # collapse during init).
+            ema_std = (sq_hat - mean_hat.pow(2)).clamp(min=1e-4).sqrt()
+            normalized = (logits - mean_hat) / ema_std
 
         if self.training:
             with torch.no_grad():
-                # Flatten across leading dims so each expert gets a per-token mean.
                 flat = logits.detach().view(-1, num_experts).float()
-                batch_mean = flat.mean(dim=0)
-                batch_sq = flat.pow(2).mean(dim=0)
-                # Cross-rank average so every rank's EMA stays in sync — without this,
-                # each rank's local stats drift independently and the router becomes
-                # rank-dependent under DP/FSDP. Mirrors the all-reduce in `post_batch`
-                # for the DeepSeek bias accumulator. `self.group` defaults to the world
-                # group (= DP group under FSDP-only).
-                if is_distributed():
-                    dist.all_reduce(batch_mean, group=self.group)
-                    dist.all_reduce(batch_sq, group=self.group)
-                    world_size = float(dist.get_world_size(self.group))
-                    batch_mean.div_(world_size)
-                    batch_sq.div_(world_size)
-                alpha = self.ema_zscore_alpha
-                self._ema_mean.mul_(alpha).add_(batch_mean, alpha=1.0 - alpha)
-                self._ema_sq.mul_(alpha).add_(batch_sq, alpha=1.0 - alpha)
+                # Accumulate sums (not means) and the token count separately, so that
+                # `post_batch` can compute the exact global mean across microbatches AND
+                # ranks via SUM-and-COUNT all-reduce — correct under uneven per-rank
+                # token counts (e.g. variable padding), unlike a mean-of-means reduction.
+                batch_sum = flat.sum(dim=0)
+                batch_sq_sum = flat.pow(2).sum(dim=0)
+                n_tokens = flat.shape[0]
+                if self._ema_logit_sum_accum is None:
+                    self._ema_logit_sum_accum = hide_from_torch(batch_sum.clone())
+                    self._ema_logit_sq_sum_accum = hide_from_torch(batch_sq_sum.clone())
+                    self._ema_token_count_accum = n_tokens
+                else:
+                    unhide_from_torch(self._ema_logit_sum_accum).add_(batch_sum)
+                    assert self._ema_logit_sq_sum_accum is not None
+                    unhide_from_torch(self._ema_logit_sq_sum_accum).add_(batch_sq_sum)
+                    self._ema_token_count_accum += n_tokens
 
         return normalized
 
@@ -591,7 +683,10 @@ class MoERouter(nn.Module):
                         tp_mesh=self.tp_mesh,
                         cp_mesh=self.cp_mesh,
                     )
-                    self.load_balancing_loss += lb_loss.detach()
+                    # Strip DTensor wrapper before accumulating into the local hidden scalar
+                    # — under TP, lb_loss is a DTensor and `local += dtensor` either errors or
+                    # silently triggers cross-rank averaging of what should be a local stat.
+                    self.load_balancing_loss += get_local_tensor(lb_loss.detach())
 
                     scaled_lb_loss = self.lb_loss_weight * lb_loss
                     aux_loss = scaled_lb_loss
@@ -605,7 +700,7 @@ class MoERouter(nn.Module):
                         tp_mesh=self.tp_mesh,
                         cp_mesh=self.cp_mesh,
                     )
-                    self.z_loss += z_loss.detach()
+                    self.z_loss += get_local_tensor(z_loss.detach())
 
                     scaled_z_loss = self.z_loss_weight * z_loss
                     aux_loss = scaled_z_loss if aux_loss is None else aux_loss + scaled_z_loss
@@ -620,7 +715,7 @@ class MoERouter(nn.Module):
                         batched_batch_size_per_expert=batched_batch_size_per_expert,
                         loss_div_factor=loss_div_factor,
                     )
-                    self.seq_aux_loss += seq_aux.detach()
+                    self.seq_aux_loss += get_local_tensor(seq_aux.detach())
 
                     scaled_seq_aux = self.seq_aux_loss_weight * seq_aux
                     aux_loss = scaled_seq_aux if aux_loss is None else aux_loss + scaled_seq_aux
