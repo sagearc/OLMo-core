@@ -22,12 +22,9 @@ Usage:
     python src/scripts/train/moe-1b.py RUN_NAME --routing=VARIANT [OVERRIDES...]
 
     where VARIANT is one of:
-        baseline       softmax + Switch lb_loss + router z-loss (floor)
-        deepseek       sigmoid + bias rule + complementary seq-aux (SOTA target)
-        ema            EMA-z-norm + softmax (proposed mechanism)
-        ema_seq_aux    EMA-z-norm + softmax + complementary seq-aux
-                       (apples-to-apples vs deepseek's 2-mechanism setup)
-        skywork        per-step batch standardization + Switch lb_loss [STUB]
+        baseline   softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
+        deepseek   sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
+        ema        EMA z-norm + softmax (proposed) — no aux loss, no z-loss
 """
 
 import sys
@@ -107,8 +104,6 @@ class RoutingVariant(StrEnum):
     baseline = "baseline"
     deepseek = "deepseek"
     ema = "ema"
-    ema_seq_aux = "ema_seq_aux"
-    skywork = "skywork"
 
 
 def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
@@ -118,20 +113,20 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
     from ``llama_like_moe(...)``; variants that disable these set them to None.
     """
     if variant == RoutingVariant.baseline:
-        # Standard softmax top-k with Switch-style auxiliary load balance + router z-loss.
-        # No router-state knobs to set; leave defaults.
+        # Standard softmax top-k with Switch-style auxiliary load-balance loss
+        # (lb=0.01) AND router z-loss (z=0.001). The classic OLMoE / Mixtral recipe.
         return
 
     if variant == RoutingVariant.deepseek:
-        # arXiv:2408.15664 (§4) + arXiv:2412.19437 (§2.1.2):
+        # arXiv:2408.15664 (§4) — strict "Auxiliary-Loss-Free Load Balancing":
         # sigmoid → bias-shifted top-k → unbiased gather → L1 renorm → bias update
-        # by sign(ideal − actual). Complementary seq-aux at α=1e-4. No standard
-        # lb_loss (replaced by bias rule) and no router z-loss (logsumexp(logits)²
-        # is a softmax-shaped penalty with no probabilistic meaning under sigmoid).
+        # by sign(ideal − actual). γ=u=1e-3 per §4.3 ("Update rate"). NO standard
+        # lb_loss (the bias rule replaces it — the whole point of the paper),
+        # NO router z-loss, and NO complementary seq-aux loss (that comes later
+        # in DeepSeek-V3 / arXiv:2412.19437; not part of the 2408 paper recipe).
         moe.router.gating_function = MoERouterGatingFunction.sigmoid
         moe.router.bias_gamma = 1e-3
         moe.router.normalize_expert_weights = 1.0
-        moe.router.seq_aux_loss_weight = 1e-4
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
@@ -139,38 +134,13 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
     if variant == RoutingVariant.ema:
         # Proposed mechanism: per-expert EMA z-normalization of router logits
         # before softmax. Update cadence: once per optimizer step (post_batch),
-        # SUM+COUNT-reduced across ranks. No auxiliary losses — the only load
-        # balancing signal is the normalization itself.
+        # SUM+COUNT-reduced across ranks. NO auxiliary losses, NO router z-loss
+        # — the only load-balancing signal is the normalization itself.
         moe.router.ema_zscore_normalize = True
         moe.router.ema_zscore_alpha = 0.99
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
-
-    if variant == RoutingVariant.ema_seq_aux:
-        # Proposed mechanism + complementary seq-aux. Matches DeepSeek's
-        # 2-mechanism count (bias rule + seq-aux), so a head-to-head against
-        # deepseek isolates "what does the EMA buy you" from "how many
-        # mechanisms do you have running".
-        moe.router.ema_zscore_normalize = True
-        moe.router.ema_zscore_alpha = 0.99
-        moe.router.seq_aux_loss_weight = 1e-4
-        moe.lb_loss_weight = None
-        moe.z_loss_weight = None
-        return
-
-    if variant == RoutingVariant.skywork:
-        # Skywork-MoE (arXiv:2406.06563): per-step BATCH standardization of
-        # router logits — `λ · (logit − μ_batch) / σ_batch` — combined WITH the
-        # standard Switch load-balance loss. Standardization is *per step*, no
-        # EMA carry-over. Differentiating from EMA is the whole point of this
-        # baseline (your closest published cousin).
-        # NOT YET IMPLEMENTED in olmo_core.nn.moe.router — would need a new
-        # gating mode or a thin wrapper around get_expert_logits().
-        raise NotImplementedError(
-            "skywork variant requires per-step batch standardization in MoERouter "
-            "(not implemented). See arXiv:2406.06563 §3.1."
-        )
 
     raise ValueError(f"unknown routing variant: {variant!r}")
 
@@ -208,6 +178,9 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
         layer_norm_eps=1e-6,
         lb_loss_weight=0.01,
         z_loss_weight=0.001,
+        # Paper-faithful weight init (arXiv:2408.15664 Appendix B): std=0.006 for all
+        # linear layers. olmo-core's default is 0.02 (truncated normal at ±3σ).
+        init_std=0.006,
     )
 
     block = cast(TransformerBlockConfig, model_config.block)
