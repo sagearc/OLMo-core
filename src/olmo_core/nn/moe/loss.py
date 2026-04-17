@@ -136,3 +136,51 @@ def router_z_loss(
         loss = DTensor.from_local(loss.unsqueeze(0), tp_mesh, (Shard(0),)).sum()
 
     return loss
+
+
+def deepseek_seq_aux_loss(
+    *,
+    num_experts: int,
+    top_k: int,
+    expert_scores: torch.Tensor,
+    batched_batch_size_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """
+    DeepSeek-v3 complementary sequence-wise auxiliary loss (arXiv:2412.19437 §2.1.2):
+    ``L = α · N_r · Σ_i f_i · P_i`` where ``f_i = (1/(K·S)) · #{tokens routed to i}`` and
+    ``P_i = (1/S) Σ_t s'_{i,t}`` with ``s'`` = the L1-normalized per-token score —
+    computed **per sequence**, then averaged across the batch.
+
+    Matches Megatron-Core's ``_apply_seq_aux_loss``
+    (megatron/core/transformer/moe/router.py:283-305): each instance in the batch is
+    treated as one "sequence". This is an approximation when packed instances contain
+    multiple documents (would need ``cu_doc_lens`` for true per-document granularity),
+    but it is what the reference DeepSeek-V3 training recipe uses.
+
+    The L1 normalization of ``s_t`` is required by the paper: ``s'_t`` is the gate-weight
+    *distribution* (sums to 1 over experts), not the raw sigmoid output. Renormalizing
+    here makes this function self-contained for both softmax (already sums to 1, no-op)
+    and sigmoid (each ``s_i`` is independent, ``Σ_i s_i`` ≠ 1) inputs.
+
+    :param num_experts: Total number of experts (``N_r`` in the paper).
+    :param top_k: Number of experts selected per token (``K_r`` in the paper).
+    :param expert_scores: Per-expert scores after the gating function,
+        shape ``(B, S, num_experts)``. Will be L1-normalized internally.
+    :param batched_batch_size_per_expert: Per-instance counts of tokens routed to each
+        expert, shape ``(B, num_experts)``. Must be detached.
+    """
+    expert_scores = get_local_tensor(expert_scores)
+    batched_batch_size_per_expert = get_local_tensor(batched_batch_size_per_expert)
+    B, S, _ = expert_scores.shape
+
+    # L1-normalize per token to get the s'_t distribution from the paper.
+    normalized_scores = expert_scores / expert_scores.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+
+    # Per-sequence f_i: shape (B, num_experts), sums to 1 across experts within each row.
+    f_i = batched_batch_size_per_expert.float() / float(S * top_k)
+    # Per-sequence P_i: mean L1-normalized score per expert within each instance.
+    p_i = normalized_scores.mean(dim=1)  # (B, num_experts)
+
+    # Per-sequence loss, then average over the batch (matches Megatron's `/ bsz`).
+    per_seq_loss = float(num_experts) * (f_i * p_i).sum(dim=-1)  # (B,)
+    return per_seq_loss.mean()

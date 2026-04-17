@@ -25,7 +25,12 @@ from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.utils import get_default_device
 
 from ..config import ModuleConfig
-from .loss import MoELoadBalancingLossGranularity, load_balancing_loss, router_z_loss
+from .loss import (
+    MoELoadBalancingLossGranularity,
+    deepseek_seq_aux_loss,
+    load_balancing_loss,
+    router_z_loss,
+)
 
 if TYPE_CHECKING:
     from olmo_core.train.common import ReduceType
@@ -92,6 +97,21 @@ class MoERouterConfig(ModuleConfig):
     uniform_expert_assignment: bool = False
     bias_gamma: Optional[float] = None
     gating_function: MoERouterGatingFunction = MoERouterGatingFunction.softmax
+    seq_aux_loss_weight: Optional[float] = None
+    """
+    If set, enables the DeepSeek-v3 complementary sequence-wise auxiliary loss
+    (arXiv:2412.19437 §2.1.2) with this weight. Paper value: ``1e-4``. Computed as a
+    microbatch-wise approximation; see :func:`olmo_core.nn.moe.loss.deepseek_seq_aux_loss`.
+    """
+    ema_zscore_normalize: bool = False
+    """
+    If True, z-normalize router logits per expert using an EMA of mean / squared-mean
+    before applying the gating function. Composes with both ``softmax`` and ``sigmoid``.
+    """
+    ema_zscore_alpha: float = 0.99
+    """
+    EMA decay used when ``ema_zscore_normalize`` is enabled.
+    """
     dtype: Optional[DType] = None
 
     def num_params(self, d_model: int, num_experts: int) -> int:
@@ -179,6 +199,9 @@ class MoERouter(nn.Module):
         uniform_expert_assignment: bool = False,
         bias_gamma: Optional[float] = None,
         gating_function: MoERouterGatingFunction = MoERouterGatingFunction.softmax,
+        seq_aux_loss_weight: Optional[float] = None,
+        ema_zscore_normalize: bool = False,
+        ema_zscore_alpha: float = 0.99,
         lb_loss_weight: Optional[float] = None,
         lb_loss_granularity: MoELoadBalancingLossGranularity = MoELoadBalancingLossGranularity.local_batch,
         z_loss_weight: Optional[float] = None,
@@ -193,6 +216,9 @@ class MoERouter(nn.Module):
         self.uniform_expert_assignment = uniform_expert_assignment
         self.bias_gamma = bias_gamma
         self.gating_function = gating_function
+        self.seq_aux_loss_weight = seq_aux_loss_weight
+        self.ema_zscore_normalize = ema_zscore_normalize
+        self.ema_zscore_alpha = ema_zscore_alpha
         self.lb_loss_weight = lb_loss_weight
         self.lb_loss_granularity = lb_loss_granularity
         self.z_loss_weight = z_loss_weight
@@ -215,6 +241,12 @@ class MoERouter(nn.Module):
         self._score_bias_batch_size_per_expert: Optional[_HiddenTensor] = None
         self._load_balancing_loss: Optional[_HiddenTensor] = None
         self._z_loss: Optional[_HiddenTensor] = None
+        self._seq_aux_loss: Optional[_HiddenTensor] = None
+        # EMA state. Plain attributes (not buffers) by design: the sharded checkpointer
+        # ignores buffers, and registering as buffers triggers FSDP bf16 buffer-dtype casts.
+        # Lazily initialized in forward() so they land on the right device.
+        self._ema_mean: Optional[torch.Tensor] = None
+        self._ema_sq: Optional[torch.Tensor] = None
 
     def reset_parameters(self):
         self._batch_size_per_expert = hide_from_torch(
@@ -234,6 +266,13 @@ class MoERouter(nn.Module):
 
         if self.z_loss_weight is not None:
             self._z_loss = hide_from_torch(torch.zeros([], device=self.device))
+
+        if self.seq_aux_loss_weight is not None:
+            self._seq_aux_loss = hide_from_torch(torch.zeros([], device=self.device))
+
+        if self.ema_zscore_normalize:
+            self._ema_mean = None
+            self._ema_sq = None
 
     @property
     def device(self) -> torch.device:
@@ -300,6 +339,19 @@ class MoERouter(nn.Module):
     def z_loss(self, value: torch.Tensor):
         self._z_loss = hide_from_torch(value)
 
+    @property
+    def seq_aux_loss(self) -> Optional[torch.Tensor]:
+        if self.seq_aux_loss_weight is not None:
+            if self._seq_aux_loss is None:
+                self._seq_aux_loss = hide_from_torch(torch.zeros([], device=self.device))
+            elif self._seq_aux_loss.device != self.device:
+                self._seq_aux_loss = self._seq_aux_loss.to(self.device)
+        return None if self._seq_aux_loss is None else unhide_from_torch(self._seq_aux_loss)
+
+    @seq_aux_loss.setter
+    def seq_aux_loss(self, value: torch.Tensor):
+        self._seq_aux_loss = hide_from_torch(value)
+
     @torch.no_grad()
     def post_batch(self, dry_run: bool = False):
         if self.bias_gamma is None or not self.training:
@@ -326,6 +378,43 @@ class MoERouter(nn.Module):
 
         # Reset the accumulator.
         batch_size_per_expert.zero_()
+
+    def _apply_ema_zscore(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Z-normalize ``logits`` per expert using stale EMA mean / E[X²], then update the EMA
+        with the current logits (training only). Gradient flows through ``logits`` only.
+        """
+        num_experts = logits.shape[-1]
+        if self._ema_mean is None or self._ema_mean.device != logits.device:
+            self._ema_mean = torch.zeros(num_experts, dtype=torch.float32, device=logits.device)
+            self._ema_sq = torch.ones(num_experts, dtype=torch.float32, device=logits.device)
+        assert self._ema_sq is not None
+
+        ema_std = (self._ema_sq - self._ema_mean.pow(2)).clamp(min=1e-8).sqrt()
+        normalized = (logits - self._ema_mean) / ema_std
+
+        if self.training:
+            with torch.no_grad():
+                # Flatten across leading dims so each expert gets a per-token mean.
+                flat = logits.detach().view(-1, num_experts).float()
+                batch_mean = flat.mean(dim=0)
+                batch_sq = flat.pow(2).mean(dim=0)
+                # Cross-rank average so every rank's EMA stays in sync — without this,
+                # each rank's local stats drift independently and the router becomes
+                # rank-dependent under DP/FSDP. Mirrors the all-reduce in `post_batch`
+                # for the DeepSeek bias accumulator. `self.group` defaults to the world
+                # group (= DP group under FSDP-only).
+                if is_distributed():
+                    dist.all_reduce(batch_mean, group=self.group)
+                    dist.all_reduce(batch_sq, group=self.group)
+                    world_size = float(dist.get_world_size(self.group))
+                    batch_mean.div_(world_size)
+                    batch_sq.div_(world_size)
+                alpha = self.ema_zscore_alpha
+                self._ema_mean.mul_(alpha).add_(batch_mean, alpha=1.0 - alpha)
+                self._ema_sq.mul_(alpha).add_(batch_sq, alpha=1.0 - alpha)
+
+        return normalized
 
     def jitter(self, x: torch.Tensor) -> torch.Tensor:
         if self.jitter_eps is None or not self.training:
@@ -400,6 +489,15 @@ class MoERouter(nn.Module):
             out["router Z loss"] = (self.z_loss_weight * self.z_loss, ReduceType.mean)
             out["router Z loss unscaled"] = (self.z_loss.clone(), ReduceType.mean)
 
+        # DeepSeek sequence-wise aux loss.
+        if self.seq_aux_loss_weight is not None:
+            assert self.seq_aux_loss is not None
+            out["seq aux loss"] = (
+                self.seq_aux_loss_weight * self.seq_aux_loss,
+                ReduceType.mean,
+            )
+            out["seq aux loss unscaled"] = (self.seq_aux_loss.clone(), ReduceType.mean)
+
         if reset:
             self.reset_metrics()
 
@@ -412,6 +510,8 @@ class MoERouter(nn.Module):
             lb_loss.zero_()
         if (z_loss := self.z_loss) is not None:
             z_loss.zero_()
+        if (seq_aux := self.seq_aux_loss) is not None:
+            seq_aux.zero_()
 
     def forward(
         self,
@@ -433,11 +533,17 @@ class MoERouter(nn.Module):
         # shape: (batch_size, seq_len, num_experts)
         logits = self.get_expert_logits(x).float()
 
+        # Optionally z-normalize logits per expert using EMA stats. Composes with both
+        # softmax and sigmoid below. Gradient flows through `logits` (not the EMA stats).
+        gating_logits = logits
+        if self.ema_zscore_normalize:
+            gating_logits = self._apply_ema_zscore(logits)
+
         # shape: (batch_size, seq_len, num_experts)
         if self.gating_function == MoERouterGatingFunction.softmax:
-            scores = logits.softmax(dim=-1)
+            scores = gating_logits.softmax(dim=-1)
         elif self.gating_function == MoERouterGatingFunction.sigmoid:
-            scores = F.sigmoid(logits) + 1e-7
+            scores = F.sigmoid(gating_logits) + 1e-7
         else:
             raise NotImplementedError(self.gating_function)
 
@@ -503,6 +609,20 @@ class MoERouter(nn.Module):
 
                     scaled_z_loss = self.z_loss_weight * z_loss
                     aux_loss = scaled_z_loss if aux_loss is None else aux_loss + scaled_z_loss
+
+                if self.seq_aux_loss_weight is not None:
+                    assert self.seq_aux_loss is not None
+
+                    seq_aux = deepseek_seq_aux_loss(
+                        num_experts=self.num_experts,
+                        top_k=self.top_k,
+                        expert_scores=scores,
+                        batched_batch_size_per_expert=batched_batch_size_per_expert,
+                    )
+                    self.seq_aux_loss += seq_aux.detach()
+
+                    scaled_seq_aux = self.seq_aux_loss_weight * seq_aux
+                    aux_loss = scaled_seq_aux if aux_loss is None else aux_loss + scaled_seq_aux
 
             self.batch_size_per_expert += batch_size_per_expert
             if self.bias_gamma is not None:
