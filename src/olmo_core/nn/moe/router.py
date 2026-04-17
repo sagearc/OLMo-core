@@ -618,6 +618,7 @@ class MoERouter(nn.Module):
                         top_k=self.top_k,
                         expert_scores=scores,
                         batched_batch_size_per_expert=batched_batch_size_per_expert,
+                        loss_div_factor=loss_div_factor,
                     )
                     self.seq_aux_loss += seq_aux.detach()
 

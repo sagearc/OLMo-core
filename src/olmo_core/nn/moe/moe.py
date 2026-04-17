@@ -159,6 +159,11 @@ class MoEBase(nn.Module):
             dtype=dtype,
             init_device=init_device,
         )
+        # The router config carries seq_aux_loss_weight (DeepSeek complementary loss);
+        # apply the same per-layer scaling we apply to lb_loss / z_loss above so all
+        # auxiliary losses have consistent semantics regardless of n_layers.
+        if scale_loss_by_num_layers and self.router.seq_aux_loss_weight is not None:
+            self.router.seq_aux_loss_weight = self.router.seq_aux_loss_weight / n_layers
         self.experts = self._init_parallel_mlp(
             d_model=d_model,
             num_experts=num_experts,

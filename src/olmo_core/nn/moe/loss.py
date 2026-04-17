@@ -144,6 +144,7 @@ def deepseek_seq_aux_loss(
     top_k: int,
     expert_scores: torch.Tensor,
     batched_batch_size_per_expert: torch.Tensor,
+    loss_div_factor: Optional[Union[torch.Tensor, float]] = None,
 ) -> torch.Tensor:
     """
     DeepSeek-v3 complementary sequence-wise auxiliary loss (arXiv:2412.19437 §2.1.2):
@@ -153,9 +154,13 @@ def deepseek_seq_aux_loss(
 
     Matches Megatron-Core's ``_apply_seq_aux_loss``
     (megatron/core/transformer/moe/router.py:283-305): each instance in the batch is
-    treated as one "sequence". This is an approximation when packed instances contain
-    multiple documents (would need ``cu_doc_lens`` for true per-document granularity),
-    but it is what the reference DeepSeek-V3 training recipe uses.
+    treated as one "sequence".
+
+    Microbatch handling: when ``loss_div_factor`` is provided (= total batch tokens),
+    the local microbatch contribution is normalized by global sequence count so that
+    summing across microbatches yields the true per-batch sequence average. Without
+    this, with M microbatches each of B_mb sequences, naive ``mean()`` per microbatch
+    summed across the loop gives an M× over-weighted loss.
 
     The L1 normalization of ``s_t`` is required by the paper: ``s'_t`` is the gate-weight
     *distribution* (sums to 1 over experts), not the raw sigmoid output. Renormalizing
@@ -168,6 +173,10 @@ def deepseek_seq_aux_loss(
         shape ``(B, S, num_experts)``. Will be L1-normalized internally.
     :param batched_batch_size_per_expert: Per-instance counts of tokens routed to each
         expert, shape ``(B, num_experts)``. Must be detached.
+    :param loss_div_factor: Total tokens in the full (multi-microbatch) batch.
+        If provided, used to compute total batch sequences = ``loss_div_factor / S``
+        and divides the local sum so cross-microbatch summation yields the per-batch
+        average. If None, falls back to mean over local sequences only.
     """
     expert_scores = get_local_tensor(expert_scores)
     batched_batch_size_per_expert = get_local_tensor(batched_batch_size_per_expert)
@@ -181,6 +190,10 @@ def deepseek_seq_aux_loss(
     # Per-sequence P_i: mean L1-normalized score per expert within each instance.
     p_i = normalized_scores.mean(dim=1)  # (B, num_experts)
 
-    # Per-sequence loss, then average over the batch (matches Megatron's `/ bsz`).
+    # Per-sequence loss; sum then normalize so cross-microbatch sum gives the per-batch
+    # average (loss_div_factor / S = total sequences in the full batch).
     per_seq_loss = float(num_experts) * (f_i * p_i).sum(dim=-1)  # (B,)
-    return per_seq_loss.mean()
+    if loss_div_factor is None:
+        return per_seq_loss.mean()
+    total_seqs = loss_div_factor / float(S)
+    return per_seq_loss.sum() / total_seqs
