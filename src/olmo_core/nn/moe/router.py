@@ -218,6 +218,11 @@ class MoERouter(nn.Module):
         self.gating_function = gating_function
         self.seq_aux_loss_weight = seq_aux_loss_weight
         self.ema_zscore_normalize = ema_zscore_normalize
+        if ema_zscore_normalize:
+            assert 0.0 < ema_zscore_alpha < 1.0, (
+                f"ema_zscore_alpha must be in (0, 1), got {ema_zscore_alpha}; "
+                "the bias-correction term `1 - α^t` is undefined at the boundaries."
+            )
         self.ema_zscore_alpha = ema_zscore_alpha
         self.lb_loss_weight = lb_loss_weight
         self.lb_loss_granularity = lb_loss_granularity
@@ -486,7 +491,12 @@ class MoERouter(nn.Module):
             ema_std = (sq_hat - mean_hat.pow(2)).clamp(min=1e-4).sqrt()
             normalized = (logits - mean_hat) / ema_std
 
-        if self.training:
+        # `torch.is_grad_enabled()` matches the guard the existing aux-loss path uses at
+        # forward(): under activation checkpointing, the forward call inside the no_grad
+        # region must NOT mutate state — only the recomputation during backward should.
+        # olmo-core currently raises if you try to AC-wrap an MoE block (model.py:727),
+        # but this guard keeps EMA correct if that protection is ever relaxed.
+        if self.training and torch.is_grad_enabled():
             with torch.no_grad():
                 flat = logits.detach().view(-1, num_experts).float()
                 # Accumulate sums (not means) and the token count separately, so that
