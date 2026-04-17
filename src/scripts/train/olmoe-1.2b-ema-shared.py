@@ -104,7 +104,10 @@ def build_config(run_name: str, overrides: List[str]) -> ExperimentConfig:
         num_experts=8,
         top_k=2,
         expert_hidden_size=int(0.5 * d_model),
-        shared_expert_hidden_size=d_model * 2,
+        # Equivalent to DeepSeek's N_s=2 shared experts at expert size
+        # (arXiv:2408.15664 §4 Table 5). olmo-core's MoEConfig only supports a single
+        # shared MLP, so we fold N_s=2 into one shared MLP at 2× expert size.
+        shared_expert_hidden_size=2 * int(0.5 * d_model),
         dropless=True,
         reordered_norm=True,
         qk_norm=True,

@@ -103,31 +103,45 @@ def test_router_with_ema_zscore(device: torch.device, gating_function: MoERouter
     ).to(device)
     router.train()
 
-    # EMA state is lazily initialized in forward.
-    assert router._ema_mean is None
-    assert router._ema_sq is None
+    # EMA buffers eagerly initialized to (0, 0); step_count starts at 0 so the first
+    # forward bypasses normalization (no stats yet) — Adam-style cold-start.
+    assert router._ema_mean is not None
+    assert router._ema_sq is not None
+    assert router._ema_step_count is not None
+    assert router._ema_mean.device.type == device.type
+    assert router._ema_sq.device.type == device.type
+    assert router._ema_mean.abs().sum().item() == 0
+    assert router._ema_sq.abs().sum().item() == 0
+    assert int(router._ema_step_count.item()) == 0
 
     x = torch.randn((2, 4, 128), device=device)
     weights, indices, _, _ = router(x)
     assert weights.shape == (2, 4, 2)
     assert indices.shape == (2, 4, 2)
 
-    # After one training forward, EMA state is initialized and on the right device.
-    assert router._ema_mean is not None
-    assert router._ema_sq is not None
-    assert router._ema_mean.device.type == device.type
-    assert router._ema_sq.device.type == device.type
+    # Forward only ACCUMULATES — EMA buffers themselves are unchanged until post_batch.
+    assert router._ema_mean.abs().sum().item() == 0
+    assert int(router._ema_step_count.item()) == 0
+    assert router._ema_logit_sum_accum is not None
 
-    # Stats should have moved away from the (0, 1) init.
+    # post_batch performs the per-step EMA update + step counter increment.
+    router.post_batch()
     assert router._ema_mean.abs().sum().item() > 0
+    assert router._ema_sq.abs().sum().item() > 0
+    assert int(router._ema_step_count.item()) == 1
+    assert router._ema_logit_sum_accum is None  # accumulators reset
     snapshot_mean = router._ema_mean.clone()
     snapshot_sq = router._ema_sq.clone()
+    snapshot_step = int(router._ema_step_count.item())
 
-    # In eval mode the EMA should NOT update.
+    # In eval mode the EMA should NOT update (no accumulation, post_batch is a no-op).
     router.eval()
     router(torch.randn((2, 4, 128), device=device))
+    router.post_batch()
     torch.testing.assert_close(router._ema_mean, snapshot_mean)
     torch.testing.assert_close(router._ema_sq, snapshot_sq)
+    assert int(router._ema_step_count.item()) == snapshot_step
+    assert router._ema_logit_sum_accum is None
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -168,6 +182,7 @@ def test_router_ema_tracks_input_distribution(device: torch.device):
     torch.manual_seed(0)
     for _ in range(50):
         router(torch.randn((4, 16, 32), device=device))
+        router.post_batch()
 
     # E[X^2] - (E[X])^2 should be a non-degenerate variance estimate.
     var = router._ema_sq - router._ema_mean.pow(2)
@@ -241,3 +256,161 @@ def test_seq_aux_loss_microbatch_invariance(device: torch.device):
         summed += float(mb_aux)
 
     assert abs(summed - full_value) < 1e-4, f"microbatch sum {summed} != single-batch {full_value}"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_router_ema_microbatch_cadence(device: torch.device):
+    """
+    M microbatches followed by one ``post_batch`` must produce the same EMA buffers
+    as a single forward over the concatenated batch followed by ``post_batch``.
+    Guarantees the per-step EMA decay is unambiguous and microbatch-independent.
+    """
+    torch.manual_seed(0)
+    full = torch.randn((8, 4, 32), device=device)
+
+    def _run(num_chunks: int) -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(123)
+        router = MoELinearRouter(
+            d_model=32,
+            num_experts=4,
+            top_k=2,
+            gating_function=MoERouterGatingFunction.softmax,
+            ema_zscore_normalize=True,
+            ema_zscore_alpha=0.7,
+        ).to(device)
+        router.train()
+        for chunk in full.chunk(num_chunks, dim=0):
+            router(chunk)
+        router.post_batch()
+        assert router._ema_mean is not None and router._ema_sq is not None
+        return router._ema_mean.clone(), router._ema_sq.clone()
+
+    mean_full, sq_full = _run(1)
+    mean_mb, sq_mb = _run(4)
+    torch.testing.assert_close(mean_full, mean_mb)
+    torch.testing.assert_close(sq_full, sq_mb)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_router_ema_dry_run(device: torch.device):
+    """``post_batch(dry_run=True)`` must leave EMA buffers unchanged AND clear accumulators."""
+    router = MoELinearRouter(
+        d_model=32,
+        num_experts=4,
+        top_k=2,
+        gating_function=MoERouterGatingFunction.softmax,
+        ema_zscore_normalize=True,
+    ).to(device)
+    router.train()
+
+    # First a real step so buffers move away from (0, 0).
+    torch.manual_seed(0)
+    router(torch.randn((4, 8, 32), device=device))
+    router.post_batch()
+    assert router._ema_mean is not None and router._ema_sq is not None
+    assert router._ema_step_count is not None
+    snapshot_mean = router._ema_mean.clone()
+    snapshot_sq = router._ema_sq.clone()
+    snapshot_step = int(router._ema_step_count.item())
+    assert snapshot_step == 1
+
+    # Now a dry-run step: forward fills the accumulator, but post_batch must not commit
+    # — neither the EMA buffers NOR the step counter advance.
+    router(torch.randn((4, 8, 32), device=device))
+    assert router._ema_logit_sum_accum is not None
+    router.post_batch(dry_run=True)
+    torch.testing.assert_close(router._ema_mean, snapshot_mean)
+    torch.testing.assert_close(router._ema_sq, snapshot_sq)
+    assert int(router._ema_step_count.item()) == snapshot_step
+    # Accumulators must be reset so they don't leak into the next real step.
+    assert router._ema_logit_sum_accum is None
+    assert router._ema_logit_sq_sum_accum is None
+    assert router._ema_token_count_accum == 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_router_ema_state_dict_roundtrip(device: torch.device):
+    """EMA buffers must round-trip through state_dict so checkpoint/resume preserves them."""
+    router1 = MoELinearRouter(
+        d_model=32,
+        num_experts=4,
+        top_k=2,
+        gating_function=MoERouterGatingFunction.softmax,
+        ema_zscore_normalize=True,
+        ema_zscore_alpha=0.5,
+    ).to(device)
+    router1.train()
+
+    torch.manual_seed(0)
+    for _ in range(5):
+        router1(torch.randn((4, 8, 32), device=device))
+        router1.post_batch()
+
+    state_dict = router1.state_dict()
+    assert "_ema_mean" in state_dict
+    assert "_ema_sq" in state_dict
+    assert "_ema_step_count" in state_dict
+    # EMA must be saved in fp32 so resume doesn't lose precision under bf16 training.
+    assert state_dict["_ema_mean"].dtype == torch.float32
+    assert state_dict["_ema_sq"].dtype == torch.float32
+    # Step counter persists so bias correction `1 / (1 - α^t)` is exact post-resume.
+    assert state_dict["_ema_step_count"].dtype == torch.long
+    assert int(state_dict["_ema_step_count"].item()) == 5
+
+    router2 = MoELinearRouter(
+        d_model=32,
+        num_experts=4,
+        top_k=2,
+        gating_function=MoERouterGatingFunction.softmax,
+        ema_zscore_normalize=True,
+        ema_zscore_alpha=0.5,
+    ).to(device)
+    router2.load_state_dict(state_dict)
+    assert router2._ema_mean is not None and router2._ema_sq is not None
+    assert router2._ema_step_count is not None
+    torch.testing.assert_close(router2._ema_mean, router1._ema_mean)
+    torch.testing.assert_close(router2._ema_sq, router1._ema_sq)
+    torch.testing.assert_close(router2._ema_step_count, router1._ema_step_count)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_router_ema_bias_correction(device: torch.device):
+    """
+    After exactly one optimizer step, Adam-style bias correction must yield the EXACT
+    batch mean / batch E[X²] (the ``1 - α`` shrinkage cancels). This is the property
+    that makes EMA effective from step 1 instead of ramping up over ~1/(1-α) steps.
+    """
+    torch.manual_seed(0)
+    router = MoELinearRouter(
+        d_model=32,
+        num_experts=4,
+        top_k=2,
+        gating_function=MoERouterGatingFunction.softmax,
+        ema_zscore_normalize=True,
+        ema_zscore_alpha=0.99,  # paper-realistic value
+    ).to(device)
+    router.train()
+
+    x = torch.randn((4, 16, 32), device=device)
+    # Capture the actual logits the router computes (used to populate the accumulator).
+    with torch.no_grad():
+        logits = router.get_expert_logits(x).float().view(-1, 4)
+        true_mean = logits.mean(dim=0)
+        true_sq = logits.pow(2).mean(dim=0)
+
+    router(x)
+    router.post_batch()
+
+    # Bias-corrected estimates should reproduce the exact batch statistics.
+    assert router._ema_step_count is not None
+    step = int(router._ema_step_count.item())
+    assert step == 1
+    bc = 1.0 - (router.ema_zscore_alpha**step)
+    mean_hat = router._ema_mean / bc
+    sq_hat = router._ema_sq / bc
+    torch.testing.assert_close(mean_hat, true_mean, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(sq_hat, true_sq, atol=1e-5, rtol=1e-4)
+
+    # Without bias correction, the raw EMA buffer would be (1-α)=0.01× the true value
+    # — confirm we'd be off by ~100× without the / (1 - α^t) factor.
+    assert router._ema_mean.abs().max().item() < true_mean.abs().max().item() * 0.1
