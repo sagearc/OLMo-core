@@ -21,6 +21,7 @@ tmp/
 pyrightconfig.json
 .ruff.toml
 uv.lock
+.claude
 
 
 # jupyter notebooks
@@ -60,3 +61,4 @@ site/
 /scratch/
 core
 /dataset-cache/
+slurm_output

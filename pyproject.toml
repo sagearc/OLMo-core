@@ -10,11 +10,11 @@ description = "Core training module for the Open Language Model (OLMo)"
 authors = [
     { name = "Allen Institute for Artificial Intelligence", email = "olmo@allenai.org" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 license = { file = "LICENSE" }
 dependencies = [
     "numpy",
-    "torch>=2.6.0",
+    "torch==2.11.0",
     "cached-path>=1.7.2",
     "filelock>=3.4,<4.0",
     "requests",
@@ -70,10 +70,17 @@ wandb = ["wandb"]
 all = ["ai2-olmo-core[dev,beaker,comet,dion,eval,fa4,fla,torchao,transformers,wandb]"]
 
 [tool.uv]
+index-strategy = "unsafe-best-match"
 environments = [
     "sys_platform == 'linux'",
-    "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.2"
+
+[tool.uv.sources]
+torch = { index = "pytorch-rocm" }
 
 [tool.setuptools]
 include-package-data = true
