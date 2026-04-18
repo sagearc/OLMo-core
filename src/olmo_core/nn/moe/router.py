@@ -573,6 +573,12 @@ class MoERouter(nn.Module):
             ReduceType.max,
         )
 
+        # Per-expert token share (sums to 1.0). In W&B, plot all on one chart with
+        # metric regex ``train/block .*/expert_.*/tokens percentage``.
+        expert_fraction = batch_size_per_expert.float() / batch_size_per_expert.sum()
+        for i in range(expert_fraction.shape[0]):
+            out[f"expert {i:02d}/tokens percentage"] = (expert_fraction[i], ReduceType.mean)
+
         # Load balancing loss.
         if self.lb_loss_weight is not None:
             assert self.load_balancing_loss is not None
