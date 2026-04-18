@@ -32,7 +32,13 @@ from dataclasses import dataclass
 from typing import List, cast
 
 from olmo_core.config import Config, DType, StrEnum
-from olmo_core.data import NumpyDataLoaderConfig, NumpyFSLDatasetConfig, TokenizerConfig
+from olmo_core.data import (
+    DataMix,
+    NumpyDataLoaderConfig,
+    NumpyFSLDatasetConfig,
+    NumpyPaddedFSLDatasetConfig,
+    TokenizerConfig,
+)
 from olmo_core.data.numpy_dataset import NumpyDatasetConfig
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.nn.moe import MoEConfig, MoERouterGatingFunction
@@ -48,6 +54,7 @@ from olmo_core.train.callbacks import (
     CheckpointerCallback,
     ConfigSaverCallback,
     GPUMemoryMonitorCallback,
+    LMEvaluatorCallbackConfig,
     ProfilerCallback,
     WandBCallback,
 )
@@ -63,6 +70,7 @@ GLOBAL_BATCH_SIZE = 1152 * SEQUENCE_LENGTH
 MAX_TOKENS = 100_000_000_000
 
 DATASET_DIR = "/home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized"
+EVAL_BASE_DIR = "/home/morg/students/sagiahrac/dataset/olmoe-1pct"
 REPO_DIR = "/home/morg/students/sagiahrac/repos/olmo-core-repo"
 
 DATA_PATHS = [
@@ -70,17 +78,21 @@ DATA_PATHS = [
     f"{DATASET_DIR}/dclm/part-00-00000.npy",
     f"{DATASET_DIR}/dclm/part-01-00000.npy",
     f"{DATASET_DIR}/dclm/part-02-00000.npy",
+    f"{DATASET_DIR}/dclm/part-02-00001.npy",
     f"{DATASET_DIR}/dclm/part-03-00000.npy",
     f"{DATASET_DIR}/dclm/part-04-00000.npy",
     f"{DATASET_DIR}/dclm/part-05-00000.npy",
+    f"{DATASET_DIR}/dclm/part-05-00001.npy",
     f"{DATASET_DIR}/dclm/part-06-00000.npy",
     f"{DATASET_DIR}/dclm/part-07-00000.npy",
     f"{DATASET_DIR}/dclm/part-08-00000.npy",
     f"{DATASET_DIR}/dclm/part-09-00000.npy",
     f"{DATASET_DIR}/dclm/part-10-00000.npy",
+    f"{DATASET_DIR}/dclm/part-10-00001.npy",
     f"{DATASET_DIR}/dclm/part-11-00000.npy",
     f"{DATASET_DIR}/dclm/part-12-00000.npy",
     f"{DATASET_DIR}/dclm/part-13-00000.npy",
+    f"{DATASET_DIR}/dclm/part-13-00001.npy",
     f"{DATASET_DIR}/dclm/part-14-00000.npy",
     f"{DATASET_DIR}/dclm/part-15-00000.npy",
     f"{DATASET_DIR}/open-web-math/part-0-00000.npy",
@@ -221,7 +233,7 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
             ],
             fused=True,
         ),
-        compile_model=False,
+        compile_model=True,
         dp_config=TransformerDataParallelConfig(
             name=DataParallelType.fsdp,
             param_dtype=DType.bfloat16,
@@ -249,7 +261,7 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
         .with_callback(
             "checkpointer",
             CheckpointerCallback(
-                save_interval=1000,
+                save_interval=250,
                 ephemeral_save_interval=200,
                 save_async=True,
             ),
@@ -267,6 +279,19 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
         )
         .with_callback("config_saver", ConfigSaverCallback())
         .with_callback("profiler", ProfilerCallback(enabled=False))
+        .with_callback(
+            "lm_evaluator",
+            LMEvaluatorCallbackConfig(
+                eval_dataset=NumpyPaddedFSLDatasetConfig.from_data_mix(
+                    DataMix.v3_small_ppl_validation,
+                    mix_base_dir=EVAL_BASE_DIR,
+                    sequence_length=SEQUENCE_LENGTH,
+                    tokenizer=tokenizer,
+                    work_dir=f"{REPO_DIR}/dataset-cache",
+                ),
+                eval_interval=250,
+            ),
+        )
     )
 
     return ExperimentConfig(
