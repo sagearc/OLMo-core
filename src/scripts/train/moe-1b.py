@@ -178,9 +178,16 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
         layer_norm_eps=1e-6,
         lb_loss_weight=0.01,
         z_loss_weight=0.001,
-        # Paper-faithful weight init (arXiv:2408.15664 Appendix B): std=0.006 for all
-        # linear layers. olmo-core's default is 0.02 (truncated normal at ±3σ).
-        init_std=0.006,
+        # init_std=0.02 — "Xavier/He-ish" (≈sqrt(2/(5·d_model)) at d=1024), the
+        # standard OLMoE/Switch/Megatron MoE baseline. The aux-loss-free paper
+        # (arXiv:2408.15664 App. B) uses 0.006, but that's a DeepSeek house-style
+        # constant reused verbatim across all their scales (DeepSeekMoE 2B/16B/145B)
+        # rather than fan-in-scaled. At d=1024 it's ~3× smaller than the Xavier/He
+        # rule, leaving router logits near zero — an empirical confounder: all
+        # three variants got stuck at max/mean load-imbalance ≈9 regardless of
+        # routing strategy. 0.02 lets the softmax baseline behave as intended,
+        # and since we share init across variants the comparison stays fair.
+        init_std=0.02,
     )
 
     block = cast(TransformerBlockConfig, model_config.block)
