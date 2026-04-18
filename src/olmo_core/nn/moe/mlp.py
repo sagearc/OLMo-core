@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import warnings
 from typing import List, Optional
 
@@ -22,6 +23,16 @@ try:
     gmm = grouped_gemm.ops.gmm
 except ImportError:
     gmm = None
+
+
+USE_TORCH_GROUPED_MM_ENV_VAR = "OLMO_CORE_USE_TORCH_GROUPED_MM"
+
+
+def _torch_grouped_mm_available() -> bool:
+    # Opt-in: legacy per-expert loop stays the default until we benchmark end-to-end.
+    if os.environ.get(USE_TORCH_GROUPED_MM_ENV_VAR) != "1":
+        return False
+    return hasattr(F, "grouped_mm")
 
 __all__ = ["MoEMLP", "DroplessMoEMLP"]
 
@@ -260,6 +271,13 @@ class DroplessMoEMLP(MoEMLPBase):
         if self._gmm is not None:
             # grouped-gemm only accepts BF16
             return self._gmm(x.to(torch.bfloat16), w.to(torch.bfloat16), batch_sizes, trans_b=trans_b)  # type: ignore
+        elif _torch_grouped_mm_available():
+            log_once(log, f"MoEMLP.gmm using F.grouped_mm ({USE_TORCH_GROUPED_MM_ENV_VAR}=1)")
+            # F.grouped_mm takes b shaped [E, K, N] and offs as end-of-group indices;
+            # trans_b=True means our [E, H, D] weights need a transpose to become [E, D, H].
+            b = w.transpose(1, 2) if trans_b else w
+            offs = batch_sizes.to(torch.int32).cumsum(0, dtype=torch.int32)
+            return F.grouped_mm(x.to(torch.bfloat16), b.to(torch.bfloat16), offs=offs)
         else:
             out = []
             start = 0

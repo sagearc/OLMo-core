@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
 from olmo_core.config import DType
@@ -23,6 +24,10 @@ from olmo_core.nn.moe import (
     MoELoadBalancingLossGranularity,
     MoERouterConfig,
     MoEType,
+)
+from olmo_core.nn.moe.mlp import (
+    USE_TORCH_GROUPED_MM_ENV_VAR,
+    DroplessMoEMLP,
 )
 from olmo_core.testing import (
     has_grouped_gemm,
@@ -275,4 +280,94 @@ def test_moe_num_flops_per_token(shared: bool):
     assert relative_error < tolerance, (
         f"Estimated FLOPs ({estimated_flops_per_token}) differs too much from actual ({actual_flops_per_token}), "
         f"{relative_error=:.2%}, {tolerance=:.2%}"
+    )
+
+
+def _build_sizes(distribution: str, num_experts: int, device: str) -> torch.Tensor:
+    if distribution == "balanced":
+        sizes = torch.full((num_experts,), 32, dtype=torch.long)
+    elif distribution == "imbalanced":
+        g = torch.Generator().manual_seed(1)
+        sizes = torch.randint(5, 100, (num_experts,), generator=g, dtype=torch.long)
+    elif distribution == "hot_expert":
+        sizes = torch.tensor([500] + [10] * (num_experts - 1), dtype=torch.long)
+    elif distribution == "dead_expert":
+        sizes = torch.tensor([0, 100] + [20] * (num_experts - 2), dtype=torch.long)
+    elif distribution == "single_expert":
+        sizes = torch.tensor([200] + [0] * (num_experts - 1), dtype=torch.long)
+    else:
+        raise ValueError(distribution)
+    return sizes.to(device)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not hasattr(F, "grouped_mm"), reason="torch.nn.functional.grouped_mm not available"
+)
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize(
+    "distribution",
+    ["balanced", "imbalanced", "hot_expert", "dead_expert", "single_expert"],
+)
+def test_dropless_gmm_torch_matches_loop(
+    distribution: str, trans_b: bool, monkeypatch: pytest.MonkeyPatch
+):
+    """The env-var-gated ``F.grouped_mm`` path must produce the same output
+    as the legacy per-expert loop in :meth:`DroplessMoEMLP.gmm`."""
+    seed_all(0)
+    E, d_model, hidden = 16, 128, 64
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    model = DroplessMoEMLP(
+        d_model=d_model, hidden_size=hidden, num_experts=E, init_device=device
+    ).to(device=device, dtype=dtype)
+
+    sizes = _build_sizes(distribution, E, device)
+    T = int(sizes.sum().item())
+    x = torch.randn(T, d_model, device=device, dtype=dtype)
+    w_shape = (E, hidden, d_model) if trans_b else (E, d_model, hidden)
+    w = torch.randn(*w_shape, device=device, dtype=dtype)
+
+    monkeypatch.setenv(USE_TORCH_GROUPED_MM_ENV_VAR, "0")
+    y_loop = model.gmm(x, w, sizes, trans_b=trans_b)
+    monkeypatch.setenv(USE_TORCH_GROUPED_MM_ENV_VAR, "1")
+    y_gmm = model.gmm(x, w, sizes, trans_b=trans_b)
+
+    assert y_loop.shape == y_gmm.shape
+    # Reduction order is identical between the two paths for these shapes, so
+    # outputs are bit-exact. Loosen to torch.testing.assert_close if a future
+    # torch/ROCm release changes the kernel internals.
+    assert torch.equal(y_loop, y_gmm), (
+        f"max|diff|={(y_loop - y_gmm).abs().max().item()}"
+    )
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not hasattr(F, "grouped_mm"), reason="torch.nn.functional.grouped_mm not available"
+)
+def test_dropless_moe_forward_gmm_matches_loop(monkeypatch: pytest.MonkeyPatch):
+    """End-to-end SwiGLU forward (three gmm calls) must match across paths."""
+    seed_all(0)
+    E, d_model, hidden = 16, 128, 64
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    model = DroplessMoEMLP(
+        d_model=d_model, hidden_size=hidden, num_experts=E, init_device=device
+    ).to(device=device, dtype=dtype)
+
+    sizes = _build_sizes("imbalanced", E, device)
+    T = int(sizes.sum().item())
+    x = torch.randn(T, d_model, device=device, dtype=dtype)
+
+    monkeypatch.setenv(USE_TORCH_GROUPED_MM_ENV_VAR, "0")
+    y_loop = model(x, sizes)
+    monkeypatch.setenv(USE_TORCH_GROUPED_MM_ENV_VAR, "1")
+    y_gmm = model(x, sizes)
+
+    assert y_loop.shape == y_gmm.shape
+    assert torch.equal(y_loop, y_gmm), (
+        f"max|diff|={(y_loop - y_gmm).abs().max().item()}"
     )
