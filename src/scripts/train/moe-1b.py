@@ -222,7 +222,7 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
     )
 
     train_module_config = TransformerTrainModuleConfig(
-        rank_microbatch_size=32 * SEQUENCE_LENGTH,
+        rank_microbatch_size=96 * SEQUENCE_LENGTH,
         max_sequence_length=SEQUENCE_LENGTH,
         optim=AdamWConfig(
             lr=1e-3,
