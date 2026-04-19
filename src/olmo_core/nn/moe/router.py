@@ -452,6 +452,26 @@ class MoERouter(nn.Module):
             self._ema_logit_sq_sum_accum = None
             self._ema_token_count_accum = 0
 
+    def _bias_corrected_ema_stats(self, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return the bias-corrected per-expert EMA mean and std that
+        :meth:`_apply_ema_zscore` uses to normalize router logits.
+
+        Caller must ensure ``step > 0`` (for ``t=0`` the EMA is uninitialized).
+        """
+        assert self._ema_mean is not None and self._ema_sq is not None
+        ema_mean = cast(torch.Tensor, self._ema_mean)
+        ema_sq = cast(torch.Tensor, self._ema_sq)
+        bc = 1.0 - (self.ema_zscore_alpha**step)
+        mean_hat = ema_mean / bc
+        sq_hat = ema_sq / bc
+        # Std floor of 1e-2 (clamp on var = 1e-4) keeps `(logits - μ) / σ` from
+        # blowing up to Inf under bf16 if the EMA variance ever collapses (e.g.
+        # immediately post-checkpoint-load before stats refill, or transient
+        # collapse during init).
+        ema_std = (sq_hat - mean_hat.pow(2)).clamp(min=1e-4).sqrt()
+        return mean_hat, ema_std
+
     def _apply_ema_zscore(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Z-normalize ``logits`` per expert using the EMA snapshot from the previous optimizer
@@ -471,24 +491,14 @@ class MoERouter(nn.Module):
         forward sees raw logits, which is acceptable for one batch and avoids
         normalizing by an undefined std.
         """
-        assert self._ema_mean is not None and self._ema_sq is not None
         assert self._ema_step_count is not None
-        ema_mean = cast(torch.Tensor, self._ema_mean)
-        ema_sq = cast(torch.Tensor, self._ema_sq)
         step = int(cast(torch.Tensor, self._ema_step_count).item())
         num_experts = logits.shape[-1]
 
         if step == 0:
             normalized = logits
         else:
-            bc = 1.0 - (self.ema_zscore_alpha**step)
-            mean_hat = ema_mean / bc
-            sq_hat = ema_sq / bc
-            # Std floor of 1e-2 (clamp on var = 1e-4) keeps `(logits - μ) / σ` from
-            # blowing up to Inf under bf16 if the EMA variance ever collapses (e.g.
-            # immediately post-checkpoint-load before stats refill, or transient
-            # collapse during init).
-            ema_std = (sq_hat - mean_hat.pow(2)).clamp(min=1e-4).sqrt()
+            mean_hat, ema_std = self._bias_corrected_ema_stats(step)
             normalized = (logits - mean_hat) / ema_std
 
         # `torch.is_grad_enabled()` matches the guard the existing aux-loss path uses at
@@ -605,6 +615,22 @@ class MoERouter(nn.Module):
                 ReduceType.mean,
             )
             out["seq aux loss unscaled"] = (self.seq_aux_loss.clone(), ReduceType.mean)
+
+        # Log the bias-corrected per-expert mean/std that `_apply_ema_zscore` actually
+        # applies, not the raw (biased) accumulators.
+        if self.ema_zscore_normalize:
+            assert self._ema_mean is not None and self._ema_step_count is not None
+            ema_step = cast(torch.Tensor, self._ema_step_count)
+            step = int(ema_step.item())
+            if step > 0:
+                mean_hat, ema_std = self._bias_corrected_ema_stats(step)
+            else:
+                mean_hat = cast(torch.Tensor, self._ema_mean)
+                ema_std = torch.zeros_like(mean_hat)
+            for i in range(mean_hat.shape[0]):
+                out[f"expert {i:02d}/ema mean"] = (mean_hat[i], ReduceType.mean)
+                out[f"expert {i:02d}/ema std"] = (ema_std[i], ReduceType.mean)
+            out["ema step"] = (ema_step.float(), ReduceType.mean)
 
         if reset:
             self.reset_metrics()

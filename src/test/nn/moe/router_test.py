@@ -190,6 +190,51 @@ def test_router_ema_tracks_input_distribution(device: torch.device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_router_ema_zscore_compute_metrics(device: torch.device):
+    num_experts = 4
+    router = MoELinearRouter(
+        d_model=32,
+        num_experts=num_experts,
+        top_k=2,
+        gating_function=MoERouterGatingFunction.softmax,
+        ema_zscore_normalize=True,
+        ema_zscore_alpha=0.5,
+    ).to(device)
+    router.train()
+
+    # t=0: compute_metrics should emit zero-valued mean/std and ema step = 0.
+    metrics = router.compute_metrics(reset=False)
+    assert metrics["ema step"][0].item() == 0
+    for i in range(num_experts):
+        assert metrics[f"expert {i:02d}/ema mean"][0].item() == 0.0
+        assert metrics[f"expert {i:02d}/ema std"][0].item() == 0.0
+
+    # Advance the EMA past t=0.
+    torch.manual_seed(0)
+    for _ in range(5):
+        router(torch.randn((4, 16, 32), device=device))
+        router.post_batch()
+
+    metrics = router.compute_metrics(reset=False)
+    assert metrics["ema step"][0].item() == 5
+    for i in range(num_experts):
+        mean_val = metrics[f"expert {i:02d}/ema mean"][0]
+        std_val = metrics[f"expert {i:02d}/ema std"][0]
+        assert mean_val.ndim == 0 and torch.isfinite(mean_val)
+        assert std_val.ndim == 0 and torch.isfinite(std_val)
+        assert std_val.item() > 0.0
+
+    # Bias-corrected values should match what `_apply_ema_zscore` would use.
+    step = int(router._ema_step_count.item())
+    bc = 1.0 - (router.ema_zscore_alpha**step)
+    expected_mean = router._ema_mean / bc
+    expected_std = (router._ema_sq / bc - expected_mean.pow(2)).clamp(min=1e-4).sqrt()
+    for i in range(num_experts):
+        assert torch.allclose(metrics[f"expert {i:02d}/ema mean"][0], expected_mean[i], atol=1e-6)
+        assert torch.allclose(metrics[f"expert {i:02d}/ema std"][0], expected_std[i], atol=1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_router_with_seq_aux_loss(device: torch.device):
     router = MoELinearRouter(
         d_model=64,
