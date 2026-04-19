@@ -25,6 +25,7 @@ if [ -z "$WANDB_API_KEY" ]; then
 fi
 
 export ROCM_HOME=/opt/rocm-6.4.3
+export OLMO_CORE_USE_TORCH_GROUPED_MM=1
 
 cd /home/morg/students/sagiahrac/repos/olmo-core-repo
 
