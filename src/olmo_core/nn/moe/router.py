@@ -527,7 +527,9 @@ class MoERouter(nn.Module):
             ℓ_t = α·(ℓ_{t-1} + b_{t-1}) + (1-α)·y_t
             b_t = β·b_{t-1}            + (1-β)·(ℓ_t - ℓ_{t-1})
 
-        Forecast at forward-time (h=1): ``ℓ_t + b_t`` — lag-free for linear drift.
+        Forecast at forward-time (h=1): ``ℓ_t + b_t`` — lag-free for linear drift at
+        steady state. Startup transient has complex eigenvalues (|λ| = √α); at α=0.99
+        it takes ~1/(1-√α) ≈ 200 steps of oscillatory decay to settle.
         """
         old_level = level.clone()
         level.mul_(alpha).add_(trend, alpha=alpha).add_(obs, alpha=1.0 - alpha)
@@ -560,7 +562,8 @@ class MoERouter(nn.Module):
         # Std floor of 1e-2 (clamp on var = 1e-4) keeps `(logits - μ) / σ` from
         # blowing up to Inf under bf16 if the EMA variance ever collapses (e.g.
         # immediately post-checkpoint-load before stats refill, or transient
-        # collapse during init).
+        # collapse during init). On the Holt's path, the clamp also absorbs brief
+        # `sq_hat < mean_hat²` excursions from trend overshoots on sq.
         ema_std = (sq_hat - mean_hat.pow(2)).clamp(min=1e-4).sqrt()
         return mean_hat, ema_std
 
@@ -722,7 +725,6 @@ class MoERouter(nn.Module):
             for i in range(mean_hat.shape[0]):
                 out[f"expert {i:02d}/ema mean"] = (mean_hat[i], ReduceType.mean)
                 out[f"expert {i:02d}/ema std"] = (ema_std[i], ReduceType.mean)
-            out["ema step"] = (ema_step.float(), ReduceType.mean)
 
         if reset:
             self.reset_metrics()
