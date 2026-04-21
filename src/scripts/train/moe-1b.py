@@ -22,9 +22,11 @@ Usage:
     python src/scripts/train/moe-1b.py RUN_NAME --routing=VARIANT [OVERRIDES...]
 
     where VARIANT is one of:
-        baseline   softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
-        deepseek   sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
-        ema        EMA z-norm + softmax (proposed) — no aux loss, no z-loss
+        baseline    softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
+        deepseek    sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
+        ema         EMA z-norm + softmax (proposed) — no aux loss, no z-loss
+        ema_trend   as `ema`, plus Holt's linear-trend smoothing on the EMA stats —
+                    lag-free under sustained drift, addresses the collapse of plain `ema`
 """
 
 import sys
@@ -116,6 +118,7 @@ class RoutingVariant(StrEnum):
     baseline = "baseline"
     deepseek = "deepseek"
     ema = "ema"
+    ema_trend = "ema_trend"
 
 
 def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
@@ -150,6 +153,19 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         # — the only load-balancing signal is the normalization itself.
         moe.router.ema_zscore_normalize = True
         moe.router.ema_zscore_alpha = 0.99
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_trend:
+        # `ema` + Holt's linear-trend (double exponential) smoothing. Level update
+        # anticipates drift via the trend term; forecast is lag-free for linear drift.
+        # Fixes the forward-peaking feedback loop where plain EMA's σ̂ lags σ_true
+        # during sustained drift and makes load imbalance climb.
+        moe.router.ema_zscore_normalize = True
+        moe.router.ema_zscore_alpha = 0.99
+        moe.router.ema_zscore_trend = True
+        moe.router.ema_zscore_trend_beta = 0.9
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return

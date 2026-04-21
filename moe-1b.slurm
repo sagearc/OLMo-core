@@ -10,7 +10,7 @@
 #SBATCH --gres=gpu:amd:1
 #SBATCH --time=5-00:00:00
 
-# Required env var: ROUTING (one of: baseline, deepseek, ema, ema_seq_aux).
+# Required env var: ROUTING (one of: baseline, deepseek, ema, ema_trend).
 # ``--export=ALL`` propagates WANDB_API_KEY etc. from the submission env.
 # Submit with:
 #   sbatch --job-name=moe-1b-baseline --export=ALL,ROUTING=baseline moe-1b.slurm

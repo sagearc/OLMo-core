@@ -16,6 +16,7 @@ from olmo_core.config import DType, StrEnum
 from olmo_core.distributed.utils import (
     _HiddenTensor,
     distribute_like,
+    get_full_tensor,
     get_local_tensor,
     hide_from_torch,
     is_distributed,
@@ -112,6 +113,20 @@ class MoERouterConfig(ModuleConfig):
     """
     EMA decay used when ``ema_zscore_normalize`` is enabled.
     """
+    ema_zscore_trend: bool = False
+    """
+    If True, promote the EMA z-score stats to Holt's linear-trend (double exponential)
+    smoothing. Level update anticipates drift via ``ℓ_t = α·(ℓ_{t-1}+b_{t-1}) + (1-α)·y_t``;
+    trend is an EMA of per-step level diffs. Forecast at forward-time is ``ℓ+b`` (h=1),
+    which has zero steady-state lag for linear drift (vs. plain EMA's α/(1-α) lag).
+    Addresses forward-peaking from σ̂ underestimating σ_true during sustained drift.
+    """
+    ema_zscore_trend_beta: float = 0.9
+    """
+    Trend-EMA old-weight (same convention as ``ema_zscore_alpha``). At 0.9: trend is
+    90% history + 10% new diff — textbook Holt's β*=0.1. Lower → more responsive,
+    noisier. Only used when ``ema_zscore_trend`` is enabled.
+    """
     dtype: Optional[DType] = None
 
     def num_params(self, d_model: int, num_experts: int) -> int:
@@ -202,6 +217,8 @@ class MoERouter(nn.Module):
         seq_aux_loss_weight: Optional[float] = None,
         ema_zscore_normalize: bool = False,
         ema_zscore_alpha: float = 0.99,
+        ema_zscore_trend: bool = False,
+        ema_zscore_trend_beta: float = 0.9,
         lb_loss_weight: Optional[float] = None,
         lb_loss_granularity: MoELoadBalancingLossGranularity = MoELoadBalancingLossGranularity.local_batch,
         z_loss_weight: Optional[float] = None,
@@ -224,6 +241,16 @@ class MoERouter(nn.Module):
                 "the bias-correction term `1 - α^t` is undefined at the boundaries."
             )
         self.ema_zscore_alpha = ema_zscore_alpha
+        self.ema_zscore_trend = ema_zscore_trend
+        if ema_zscore_trend:
+            assert ema_zscore_normalize, (
+                "ema_zscore_trend requires ema_zscore_normalize=True; it's a modifier "
+                "on the EMA path, not a standalone mode."
+            )
+            assert 0.0 < ema_zscore_trend_beta < 1.0, (
+                f"ema_zscore_trend_beta must be in (0, 1), got {ema_zscore_trend_beta}."
+            )
+        self.ema_zscore_trend_beta = ema_zscore_trend_beta
         self.lb_loss_weight = lb_loss_weight
         self.lb_loss_granularity = lb_loss_granularity
         self.z_loss_weight = z_loss_weight
@@ -259,6 +286,21 @@ class MoERouter(nn.Module):
             self.register_buffer("_ema_mean", None)
             self.register_buffer("_ema_sq", None)
             self.register_buffer("_ema_step_count", None)
+
+        # Holt's trend companions. Initialized to zero; the level update reduces to plain
+        # EMA when trend ≈ 0, so startup is graceful — no bc-style correction needed.
+        if self.ema_zscore_trend:
+            self.register_buffer(
+                "_ema_mean_trend",
+                torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
+            )
+            self.register_buffer(
+                "_ema_sq_trend",
+                torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
+            )
+        else:
+            self.register_buffer("_ema_mean_trend", None)
+            self.register_buffer("_ema_sq_trend", None)
 
         # NOTE: we don't use buffers for these because we don't want FSDP to manage them, and we
         # don't use a BufferCache because `torch.compile()` doesn't handle that well when we're modifying
@@ -306,6 +348,10 @@ class MoERouter(nn.Module):
             cast(torch.Tensor, self._ema_step_count).zero_()
             self._ema_logit_sum_accum = None
             self._ema_logit_sq_sum_accum = None
+            if self.ema_zscore_trend:
+                assert self._ema_mean_trend is not None and self._ema_sq_trend is not None
+                cast(torch.Tensor, self._ema_mean_trend).zero_()
+                cast(torch.Tensor, self._ema_sq_trend).zero_()
             self._ema_token_count_accum = 0
 
     @property
@@ -443,8 +489,22 @@ class MoERouter(nn.Module):
 
             if not dry_run:
                 alpha = self.ema_zscore_alpha
-                ema_mean.mul_(alpha).add_(global_mean, alpha=1.0 - alpha)
-                ema_sq.mul_(alpha).add_(global_sq, alpha=1.0 - alpha)
+                if self.ema_zscore_trend:
+                    assert self._ema_mean_trend is not None and self._ema_sq_trend is not None
+                    beta = self.ema_zscore_trend_beta
+                    mean_trend = cast(torch.Tensor, self._ema_mean_trend)
+                    sq_trend = cast(torch.Tensor, self._ema_sq_trend)
+                    if ema_step.item() == 0:
+                        # Seed level from first batch instead of the zero init;
+                        # plain-EMA+bc sidesteps this via division, Holt's can't.
+                        ema_mean.copy_(global_mean)
+                        ema_sq.copy_(global_sq)
+                    else:
+                        self._holt_update(ema_mean, mean_trend, global_mean, alpha, beta)
+                        self._holt_update(ema_sq, sq_trend, global_sq, alpha, beta)
+                else:
+                    ema_mean.mul_(alpha).add_(global_mean, alpha=1.0 - alpha)
+                    ema_sq.mul_(alpha).add_(global_sq, alpha=1.0 - alpha)
                 ema_step.add_(1)  # tracks t for Adam-style bias correction in forward
 
             # Reset accumulators whether or not we applied the update — never leak.
@@ -452,19 +512,51 @@ class MoERouter(nn.Module):
             self._ema_logit_sq_sum_accum = None
             self._ema_token_count_accum = 0
 
+    @staticmethod
+    def _holt_update(
+        level: torch.Tensor,
+        trend: torch.Tensor,
+        obs: torch.Tensor,
+        alpha: float,
+        beta: float,
+    ) -> None:
+        """
+        One step of textbook Holt's linear-trend smoothing, in-place on ``level`` and
+        ``trend``. Old-weight convention (α, β ∈ (0,1), close to 1 = slow)::
+
+            ℓ_t = α·(ℓ_{t-1} + b_{t-1}) + (1-α)·y_t
+            b_t = β·b_{t-1}            + (1-β)·(ℓ_t - ℓ_{t-1})
+
+        Forecast at forward-time (h=1): ``ℓ_t + b_t`` — lag-free for linear drift.
+        """
+        old_level = level.clone()
+        level.mul_(alpha).add_(trend, alpha=alpha).add_(obs, alpha=1.0 - alpha)
+        trend.mul_(beta).add_(level - old_level, alpha=1.0 - beta)
+
     def _bias_corrected_ema_stats(self, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Return the bias-corrected per-expert EMA mean and std that
-        :meth:`_apply_ema_zscore` uses to normalize router logits.
+        Return the per-expert forecasted mean and std that :meth:`_apply_ema_zscore` uses
+        to normalize router logits.
+
+        Plain-EMA path: Adam-style bias correction ``1 / (1 - α^t)``.
+        Holt's-trend path: 1-step-ahead forecast ``ℓ + b`` — lag-free for linear drift,
+        no Adam-style bc (the trend-aware level update makes the level itself unbiased).
 
         Caller must ensure ``step > 0`` (for ``t=0`` the EMA is uninitialized).
         """
         assert self._ema_mean is not None and self._ema_sq is not None
         ema_mean = cast(torch.Tensor, self._ema_mean)
         ema_sq = cast(torch.Tensor, self._ema_sq)
-        bc = 1.0 - (self.ema_zscore_alpha**step)
-        mean_hat = ema_mean / bc
-        sq_hat = ema_sq / bc
+        if self.ema_zscore_trend:
+            assert self._ema_mean_trend is not None and self._ema_sq_trend is not None
+            mean_trend = cast(torch.Tensor, self._ema_mean_trend)
+            sq_trend = cast(torch.Tensor, self._ema_sq_trend)
+            mean_hat = ema_mean + mean_trend
+            sq_hat = ema_sq + sq_trend
+        else:
+            bc = 1.0 - (self.ema_zscore_alpha**step)
+            mean_hat = ema_mean / bc
+            sq_hat = ema_sq / bc
         # Std floor of 1e-2 (clamp on var = 1e-4) keeps `(logits - μ) / σ` from
         # blowing up to Inf under bf16 if the EMA variance ever collapses (e.g.
         # immediately post-checkpoint-load before stats refill, or transient
@@ -822,6 +914,28 @@ class MoELinearRouter(MoERouter):
         return F.linear(
             x.float(), get_local_tensor(self.weight).view(self.num_experts, self.d_model).float()
         )
+
+    @torch.no_grad()
+    def compute_metrics(
+        self, reset: bool = True
+    ) -> Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]]:
+        from olmo_core.train.common import ReduceType
+
+        # `.grad` is populated between backward and optim.step — see
+        # `TransformerTrainModule.train_batch`. Useful for detecting router weight runaway
+        # under ema-zscore feedback loops.
+        out = super().compute_metrics(reset=False)
+        if self.weight.grad is not None:
+            full_grad = get_full_tensor(self.weight.grad.detach()).float()
+            per_expert_grad_norm = full_grad.view(self.num_experts, self.d_model).norm(dim=1)
+            for i in range(per_expert_grad_norm.shape[0]):
+                out[f"expert {i:02d}/weight grad norm"] = (
+                    per_expert_grad_norm[i],
+                    ReduceType.mean,
+                )
+        if reset:
+            self.reset_metrics()
+        return out
 
     def apply_tp(self, tp_mesh: DeviceMesh, float8_enabled: bool = False):
         super().apply_tp(tp_mesh, float8_enabled=float8_enabled)
