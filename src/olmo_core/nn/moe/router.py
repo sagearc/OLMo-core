@@ -622,8 +622,8 @@ class MoERouter(nn.Module):
 
         The 1-step-ahead forecast used at forward-time is ``ℓ_t + b_t`` — this has
         zero steady-state lag for linearly-drifting input, which is why we can't
-        replace it with plain EMA for the mean (plain EMA has a 100-step lag at
-        α=0.99, which compounds into routing imbalance — see
+        replace it with plain EMA for the mean (plain EMA has an ``α/(1-α) ≈ 99``
+        step lag at α=0.99, which compounds into routing imbalance — see
         EMA_ZSCORE_ANALYSIS.md). Used for the mean only; variance uses plain EMA.
         """
         old_level = level.clone()
