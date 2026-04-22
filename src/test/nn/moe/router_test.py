@@ -227,9 +227,9 @@ def test_router_ema_zscore_compute_metrics(device: torch.device):
 
     # Bias-corrected values should match what `_apply_ema_zscore` would use.
     step = int(router._ema_step_count.item())
-    bc = 1.0 - (router.ema_zscore_alpha**step)
-    expected_mean = router._ema_mean / bc
-    expected_std = (router._ema_var / bc).clamp(min=1e-4).sqrt()
+    bias_correction = 1.0 - (router.ema_zscore_alpha**step)
+    expected_mean = router._ema_mean / bias_correction
+    expected_std = (router._ema_var / bias_correction).clamp(min=1e-4).sqrt()
     for i in range(num_experts):
         assert torch.allclose(metrics[f"expert {i:02d}/ema mean"][0], expected_mean[i], atol=1e-6)
         assert torch.allclose(metrics[f"expert {i:02d}/ema std"][0], expected_std[i], atol=1e-6)
@@ -418,8 +418,8 @@ def test_router_ema_state_dict_roundtrip(device: torch.device):
     torch.testing.assert_close(router2._ema_var, router1._ema_var)
     torch.testing.assert_close(router2._ema_step_count, router1._ema_step_count)
     # The Python shadow of the step count must be re-synced from the checkpointed
-    # buffer on load — otherwise `_apply_ema_zscore` would apply the wrong bc factor
-    # until the next post_batch silently re-aligned them.
+    # buffer on load — otherwise `_apply_ema_zscore` would apply the wrong bias
+    # correction factor until the next post_batch silently re-aligned them.
     assert router2._ema_step_py == router1._ema_step_py == 5
 
 
@@ -455,9 +455,9 @@ def test_router_ema_bias_correction(device: torch.device):
     assert router._ema_step_count is not None
     step = int(router._ema_step_count.item())
     assert step == 1
-    bc = 1.0 - (router.ema_zscore_alpha**step)
-    mean_hat = router._ema_mean / bc
-    var_hat = router._ema_var / bc
+    bias_correction = 1.0 - (router.ema_zscore_alpha**step)
+    mean_hat = router._ema_mean / bias_correction
+    var_hat = router._ema_var / bias_correction
     torch.testing.assert_close(mean_hat, true_mean, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(var_hat, true_var, atol=1e-5, rtol=1e-4)
 
