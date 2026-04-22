@@ -143,6 +143,29 @@ class MoERouterConfig(ModuleConfig):
     ~10-step memory (textbook Holt's β*=0.1). Lower → more responsive, noisier.
     Only used when ``ema_zscore_trend`` is enabled.
     """
+    ema_zscore_trend_damping: float = 1.0
+    """
+    Gardner-McKenzie damping φ on the trend (Gardner 1985). Forecast becomes
+    ``μ̂ = ℓ + φ·b`` and the level update becomes
+    ``ℓ_t = α·(ℓ_{t-1} + φ·b_{t-1}) + (1-α)·y_t``. At φ=1.0 this reduces to
+    undamped Holt's (current default, zero steady-state lag). At φ<1, the forecast
+    read at step ``t`` lags the true mean ``y_t`` by ``(1-φ)·m/(1-α)`` under drift
+    rate ``m``, which creates a z-score offset ``(1-φ)·m/((1-α)·σ̂)`` that
+    systematically suppresses the softmax share for drifting experts — i.e. an
+    implicit gradient-suppression regularizer on router weight magnitude.
+    Tradeoff:
+
+    - φ=1.0 (default): no lag, zero routing centering bias, no implicit
+      regularization. μ̂ magnitude is bounded only by weight decay.
+    - φ≈0.9: ~30% gradient suppression on high-drift experts (`m/σ̂ ≈ 0.04`),
+      routing centering bias ~0.4σ, meaningful reduction in μ̂ equilibrium.
+    - φ→0: approaches plain EMA's logarithmic-saturation regime (Lambert-W);
+      strong regularization, large centering bias.
+
+    See ``EMA_ZSCORE_ANALYSIS.md`` §4 for the tradeoff argument; this knob lets
+    you explicitly choose a middle point. Only used when ``ema_zscore_trend`` is
+    enabled. Must be in (0, 1].
+    """
     ema_zscore_trend_warmup: int = 1000
     """
     Hold the mean's trend buffer at zero (plain EMA + Adam-style bias correction)
@@ -248,6 +271,7 @@ class MoERouter(nn.Module):
         ema_zscore_trend: bool = False,
         ema_zscore_trend_beta: float = 0.9,
         ema_zscore_trend_warmup: int = 1000,
+        ema_zscore_trend_damping: float = 1.0,
         lb_loss_weight: Optional[float] = None,
         lb_loss_granularity: MoELoadBalancingLossGranularity = MoELoadBalancingLossGranularity.local_batch,
         z_loss_weight: Optional[float] = None,
@@ -282,8 +306,12 @@ class MoERouter(nn.Module):
             assert (
                 ema_zscore_trend_warmup >= 0
             ), f"ema_zscore_trend_warmup must be >= 0, got {ema_zscore_trend_warmup}."
+            assert (
+                0.0 < ema_zscore_trend_damping <= 1.0
+            ), f"ema_zscore_trend_damping must be in (0, 1], got {ema_zscore_trend_damping}."
         self.ema_zscore_trend_beta = ema_zscore_trend_beta
         self.ema_zscore_trend_warmup = ema_zscore_trend_warmup
+        self.ema_zscore_trend_damping = ema_zscore_trend_damping
         self.lb_loss_weight = lb_loss_weight
         self.lb_loss_granularity = lb_loss_granularity
         self.z_loss_weight = z_loss_weight
@@ -566,8 +594,9 @@ class MoERouter(nn.Module):
                 if use_trend:
                     assert self._ema_mean_trend is not None
                     beta = self.ema_zscore_trend_beta
+                    phi = self.ema_zscore_trend_damping
                     mean_trend = cast(torch.Tensor, self._ema_mean_trend)
-                    self._holt_update(ema_mean, mean_trend, global_mean, alpha, beta)
+                    self._holt_update(ema_mean, mean_trend, global_mean, alpha, beta, phi)
                 else:
                     ema_mean.lerp_(global_mean, 1.0 - alpha)
                 ema_var.lerp_(global_var, 1.0 - alpha)
@@ -589,10 +618,11 @@ class MoERouter(nn.Module):
         observation: torch.Tensor,
         alpha: float,
         beta: float,
+        phi: float = 1.0,
     ) -> None:
         """
-        One step of textbook undamped Holt's linear-trend smoothing, in-place on
-        ``level`` and ``trend``.
+        One step of Holt's linear-trend smoothing with optional Gardner-McKenzie
+        damping, in-place on ``level`` and ``trend``.
 
         Meaning of each argument in *this* router's context — Holt's is applied to
         the per-expert mean logit, so all three tensors are shape ``(num_experts,)``:
@@ -610,24 +640,31 @@ class MoERouter(nn.Module):
           α=0.99, ``level`` has ~100-step memory of its observations.
         - ``beta`` — decay for ``trend`` (same convention). At β=0.9, ``trend``
           has ~10-step memory of level-differences.
+        - ``phi`` — Gardner-McKenzie damping (Gardner 1985). φ=1.0 is undamped
+          Holt's (default). φ<1 damps the trend contribution inside the level
+          update, creating an intentional forecast lag that acts as an implicit
+          gradient-suppression regularizer on drifting experts.
 
-        Update equations (Hyndman-style old-weight convention, α, β ∈ (0,1))::
+        Update equations (Hyndman-style old-weight convention, α, β ∈ (0,1),
+        φ ∈ (0,1])::
 
-            ℓ_t = α·(ℓ_{t-1} + b_{t-1}) + (1-α)·y_t
-            b_t = β·b_{t-1}            + (1-β)·(ℓ_t - ℓ_{t-1})
+            ℓ_t = α·(ℓ_{t-1} + φ·b_{t-1}) + (1-α)·y_t
+            b_t = β·b_{t-1}                + (1-β)·(ℓ_t - ℓ_{t-1})
 
-        In words: the new level blends the previous level+trend forecast with the
-        current observation; the new trend blends the previous trend with the
-        actual change in level we just observed.
+        In words: the new level blends the previous level+damped-trend forecast
+        with the current observation; the new trend blends the previous trend with
+        the actual change in level we just observed. With φ=1 this is the textbook
+        undamped update.
 
-        The 1-step-ahead forecast used at forward-time is ``ℓ_t + b_t`` — this has
-        zero steady-state lag for linearly-drifting input, which is why we can't
-        replace it with plain EMA for the mean (plain EMA has an ``α/(1-α) ≈ 99``
-        step lag at α=0.99, which compounds into routing imbalance — see
-        EMA_ZSCORE_ANALYSIS.md). Used for the mean only; variance uses plain EMA.
+        The 1-step-ahead forecast used at forward-time is ``ℓ_t + φ·b_t``. At φ=1
+        this has zero steady-state lag for linear drift (the undamped behavior
+        that motivated switching away from plain EMA). At φ<1 the forecast read
+        at step ``t`` lags the current mean ``y_t`` by ``(1-φ)·m/(1-α)`` under
+        drift rate ``m`` — see :meth:`_bias_corrected_ema_stats` for how this is
+        applied.
         """
         old_level = level.clone()
-        level.mul_(alpha).add_(trend, alpha=alpha).add_(observation, alpha=1.0 - alpha)
+        level.mul_(alpha).add_(trend, alpha=alpha * phi).add_(observation, alpha=1.0 - alpha)
         trend.mul_(beta).add_(level - old_level, alpha=1.0 - beta)
 
     def _bias_corrected_ema_stats(self, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -645,7 +682,8 @@ class MoERouter(nn.Module):
 
         Mean path:
             plain EMA (step < warmup or trend disabled):  ``μ̂ = ℓ_μ / (1 - α^t)``
-            Holt's    (step ≥ warmup):                    ``μ̂ = (ℓ_μ + b_μ) / (1 - α^t)``
+            Holt's    (step ≥ warmup):                    ``μ̂ = (ℓ_μ + φ·b_μ) / (1 - α^t)``
+              where φ is ``ema_zscore_trend_damping`` (default 1.0 = undamped).
 
         Variance path (always plain EMA):                 ``σ̂² = ℓ_var / (1 - α^t)``
 
@@ -658,7 +696,8 @@ class MoERouter(nn.Module):
         if self.ema_zscore_trend and step >= self.ema_zscore_trend_warmup:
             assert self._ema_mean_trend is not None
             mean_trend = cast(torch.Tensor, self._ema_mean_trend)
-            mean_hat = (ema_mean + mean_trend) / bias_correction
+            phi = self.ema_zscore_trend_damping
+            mean_hat = (ema_mean + phi * mean_trend) / bias_correction
         else:
             mean_hat = ema_mean / bias_correction
         # Std floor of 1e-2 (clamp on var = 1e-4) is a belt-and-suspenders safety:

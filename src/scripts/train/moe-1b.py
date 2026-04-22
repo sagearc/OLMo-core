@@ -22,12 +22,14 @@ Usage:
     python src/scripts/train/moe-1b.py RUN_NAME --routing=VARIANT [OVERRIDES...]
 
     where VARIANT is one of:
-        baseline    softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
-        deepseek    sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
-        ema         EMA z-norm + softmax (proposed) — no aux loss, no z-loss
-        ema_trend   as `ema`, plus Holt's linear-trend smoothing on the MEAN only —
-                    zero steady-state lag for linear μ drift, kills the winner-takes-all
-                    feedback that plain `ema` exhibits (variance stays plain EMA by design)
+        baseline          softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
+        deepseek          sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
+        ema               EMA z-norm + softmax (proposed) — no aux loss, no z-loss
+        ema_trend         as `ema`, plus undamped Holt's linear-trend smoothing on MEAN —
+                          zero steady-state lag for linear μ drift; variance stays plain EMA
+        ema_trend_damped  as `ema_trend`, with Gardner-McKenzie damping φ=0.9 on the trend —
+                          implicit gradient-suppression regularizer on μ̂ magnitude at cost
+                          of ~0.4σ routing centering bias
 """
 
 import sys
@@ -120,6 +122,7 @@ class RoutingVariant(StrEnum):
     deepseek = "deepseek"
     ema = "ema"
     ema_trend = "ema_trend"
+    ema_trend_damped = "ema_trend_damped"
 
 
 def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
@@ -170,6 +173,28 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.router.ema_zscore_alpha = 0.99
         moe.router.ema_zscore_trend = True
         moe.router.ema_zscore_trend_beta = 0.9
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_trend_damped:
+        # `ema_trend` with Gardner-McKenzie damped Holt's (φ=0.9). Forecast is
+        # μ̂ = ℓ + 0.9·b, which gives a small steady-state lag proportional to
+        # (1−φ)·m/σ̂. That lag creates a z-score offset that suppresses the softmax
+        # share for drifting experts, acting as an implicit gradient-suppression
+        # regularizer on router weight magnitude WITHOUT adding a loss term.
+        #
+        # Tradeoff vs undamped `ema_trend`:
+        # - μ̂ equilibrium magnitude is tighter (~30% smaller at φ=0.9 for high-drift
+        #   experts), which keeps router weight norms from drifting as far.
+        # - Reintroduces a small routing centering bias (~0.4σ for the most
+        #   extreme expert, ~1.5× favoritism) — the cost of the regularization.
+        # See EMA_ZSCORE_ANALYSIS.md §4 for the full cost/benefit discussion.
+        moe.router.ema_zscore_normalize = True
+        moe.router.ema_zscore_alpha = 0.99
+        moe.router.ema_zscore_trend = True
+        moe.router.ema_zscore_trend_beta = 0.9
+        moe.router.ema_zscore_trend_damping = 0.9
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
