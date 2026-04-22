@@ -25,8 +25,9 @@ Usage:
         baseline    softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
         deepseek    sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
         ema         EMA z-norm + softmax (proposed) — no aux loss, no z-loss
-        ema_trend   as `ema`, plus Holt's linear-trend smoothing on the EMA stats —
-                    lag-free under sustained drift, addresses the collapse of plain `ema`
+        ema_trend   as `ema`, plus Holt's linear-trend smoothing on the MEAN only —
+                    zero steady-state lag for linear μ drift, kills the winner-takes-all
+                    feedback that plain `ema` exhibits (variance stays plain EMA by design)
 """
 
 import sys
@@ -158,10 +159,13 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         return
 
     if variant == RoutingVariant.ema_trend:
-        # `ema` + Holt's linear-trend (double exponential) smoothing. Level update
-        # anticipates drift via the trend term; forecast is lag-free for linear drift.
-        # Fixes the forward-peaking feedback loop where plain EMA's σ̂ lags σ_true
-        # during sustained drift and makes load imbalance climb.
+        # `ema` + Holt's linear-trend (double exponential) smoothing on the MEAN only.
+        # Undamped (φ=1 implicit): forecast μ̂ = ℓ + b has zero steady-state lag for
+        # linear drift, kills the 2× load imbalance plain `ema` accumulates from its
+        # 99-step μ lag. Variance stays plain EMA — Holt's on variance would introduce
+        # the E[X²]/μ² cancellation failure mode (see EMA_ZSCORE_ANALYSIS.md next to
+        # the router). 1000-step plain-EMA warmup on the trend avoids fitting LR-warmup
+        # noise into the slope.
         moe.router.ema_zscore_normalize = True
         moe.router.ema_zscore_alpha = 0.99
         moe.router.ema_zscore_trend = True

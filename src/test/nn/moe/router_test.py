@@ -417,6 +417,10 @@ def test_router_ema_state_dict_roundtrip(device: torch.device):
     torch.testing.assert_close(router2._ema_mean, router1._ema_mean)
     torch.testing.assert_close(router2._ema_var, router1._ema_var)
     torch.testing.assert_close(router2._ema_step_count, router1._ema_step_count)
+    # The Python shadow of the step count must be re-synced from the checkpointed
+    # buffer on load — otherwise `_apply_ema_zscore` would apply the wrong bc factor
+    # until the next post_batch silently re-aligned them.
+    assert router2._ema_step_py == router1._ema_step_py == 5
 
 
 @pytest.mark.parametrize("device", DEVICES)

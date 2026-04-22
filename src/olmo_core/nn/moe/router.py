@@ -339,6 +339,24 @@ class MoERouter(nn.Module):
         self._ema_logit_sum_accum: Optional[_HiddenTensor] = None
         self._ema_logit_sq_sum_accum: Optional[_HiddenTensor] = None
         self._ema_token_count_accum: int = 0
+        # Python-int shadow of `_ema_step_count` to avoid a device→host `.item()` sync on
+        # the forward hot path (called every microbatch via `_apply_ema_zscore`). Kept in
+        # lockstep with the buffer: incremented in `post_batch`, zeroed in
+        # `reset_parameters`, and re-synced from the buffer in `_load_from_state_dict`
+        # so checkpoint resume doesn't leave it stale.
+        self._ema_step_py: int = 0
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """
+        Rehydrate the Python shadow ``_ema_step_py`` from the checkpointed buffer after
+        any state-dict load (full or sharded). Without this, the buffer would hold the
+        resumed step count while the Python int stayed at 0, causing `_apply_ema_zscore`
+        to apply the wrong bias correction ``1 / (1 - α^t)`` until the next post_batch
+        re-synced them by accident.
+        """
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        if self.ema_zscore_normalize and self._ema_step_count is not None:
+            self._ema_step_py = int(cast(torch.Tensor, self._ema_step_count).item())
 
     def reset_parameters(self):
         self._batch_size_per_expert = hide_from_torch(
@@ -368,6 +386,7 @@ class MoERouter(nn.Module):
             cast(torch.Tensor, self._ema_mean).zero_()
             cast(torch.Tensor, self._ema_var).zero_()
             cast(torch.Tensor, self._ema_step_count).zero_()
+            self._ema_step_py = 0
             self._ema_logit_sum_accum = None
             self._ema_logit_sq_sum_accum = None
             if self.ema_zscore_trend:
@@ -521,7 +540,8 @@ class MoERouter(nn.Module):
                 # matches plain-EMA output at the transition step (seamless switch).
                 # Trend applies to the MEAN only; variance is always plain EMA.
                 use_trend = (
-                    self.ema_zscore_trend and ema_step.item() >= self.ema_zscore_trend_warmup
+                    self.ema_zscore_trend
+                    and self._ema_step_py >= self.ema_zscore_trend_warmup
                 )
                 if use_trend:
                     assert self._ema_mean_trend is not None
@@ -531,7 +551,11 @@ class MoERouter(nn.Module):
                 else:
                     ema_mean.lerp_(global_mean, 1.0 - alpha)
                 ema_var.lerp_(global_var, 1.0 - alpha)
-                ema_step.add_(1)  # tracks t for Adam-style bias correction in forward
+                # Keep the checkpointed buffer and the Python shadow in lockstep — both
+                # advance together so `_apply_ema_zscore` can read the Python int without
+                # a device→host sync on the forward hot path.
+                ema_step.add_(1)
+                self._ema_step_py += 1
 
             # Reset accumulators whether or not we applied the update — never leak.
             self._ema_logit_sum_accum = None
@@ -622,8 +646,9 @@ class MoERouter(nn.Module):
         forward sees raw logits, which is acceptable for one batch and avoids
         normalizing by an undefined std.
         """
-        assert self._ema_step_count is not None
-        step = int(cast(torch.Tensor, self._ema_step_count).item())
+        # Read the Python shadow, not `_ema_step_count.item()` — the buffer exists for
+        # checkpointing, the int for avoiding a per-microbatch device→host sync.
+        step = self._ema_step_py
         num_experts = logits.shape[-1]
 
         if step == 0:
@@ -752,7 +777,7 @@ class MoERouter(nn.Module):
         if self.ema_zscore_normalize:
             assert self._ema_mean is not None and self._ema_step_count is not None
             ema_step = cast(torch.Tensor, self._ema_step_count)
-            step = int(ema_step.item())
+            step = self._ema_step_py
             if step > 0:
                 mean_hat, ema_std = self._bias_corrected_ema_stats(step)
             else:
