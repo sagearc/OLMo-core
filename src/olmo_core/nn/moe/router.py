@@ -119,19 +119,29 @@ class MoERouterConfig(ModuleConfig):
     ema_zscore_trend: bool = False
     """
     If True, apply Holt's linear-trend smoothing (undamped) to the **mean only**.
-    Level update: ``ℓ_t = α·(ℓ_{t-1}+b_{t-1}) + (1-α)·y_t``. Forecast at forward-time
-    is ``ℓ+b`` (zero steady-state lag for linear drift, vs. plain EMA's α/(1-α) lag).
-    The variance is always smoothed with plain EMA — no trend — regardless of this
-    flag. This asymmetry is intentional: mean-bias feeds back through routing and
-    needs zero-lag tracking; variance-bias is second-order and plain EMA is strictly
-    safer (cannot drive ``σ̂²`` below zero).
+    Holt's tracks two state variables per expert:
+
+    - *level* ``ℓ`` — the smoothed estimate of the per-expert mean logit right now.
+    - *trend* ``b`` — the smoothed estimate of how fast that mean is drifting per
+      optimizer step.
+
+    Level update ``ℓ_t = α·(ℓ_{t-1}+b_{t-1}) + (1-α)·y_t`` blends the previous
+    level-plus-trend forecast with the current batch's mean ``y_t``. Forecast at
+    forward-time is ``μ̂ = ℓ+b``, which has zero steady-state lag for linear drift
+    (vs. plain EMA's α/(1-α) ≈ 99-step lag at α=0.99). The variance is always
+    smoothed with plain EMA — no trend — regardless of this flag. The asymmetry
+    is intentional: mean-bias feeds back through routing and needs zero-lag
+    tracking; variance-bias is second-order and plain EMA is strictly safer
+    (cannot drive ``σ̂²`` below zero).
     """
     ema_zscore_trend_beta: float = 0.9
     """
-    Trend-EMA old-weight for the mean's trend buffer (same convention as
-    ``ema_zscore_alpha``). At 0.9: trend is 90% history + 10% new diff — textbook
-    Holt's β*=0.1. Lower → more responsive, noisier. Only used when
-    ``ema_zscore_trend`` is enabled.
+    Old-weight for Holt's trend buffer (same convention as ``ema_zscore_alpha``):
+    close to 1 = slow to change. Trend update is
+    ``b_t = β·b_{t-1} + (1-β)·(ℓ_t - ℓ_{t-1})`` — an EMA over per-step changes in
+    the level. At 0.9 the trend is 90% history + 10% new level-diff, giving a
+    ~10-step memory (textbook Holt's β*=0.1). Lower → more responsive, noisier.
+    Only used when ``ema_zscore_trend`` is enabled.
     """
     ema_zscore_trend_warmup: int = 1000
     """
@@ -288,13 +298,20 @@ class MoERouter(nn.Module):
             self.register_buffer("score_bias", None)
 
         # EMA state — registered as buffers so they get checkpointed by the sharded
-        # checkpointer (mirrors `score_bias`). Buffer registration is safe here because
-        # the EMA is only *read* in forward; updates happen in `post_batch`, outside any
-        # torch.compile traced region. Initialized to zero so Adam-style bias correction
-        # (1 / (1 - α^t)) yields unbiased mean / variance estimates from step 1 onwards.
-        # `_ema_var` tracks Var(logit) directly from a sample-based observation, not
-        # `E[X²]` — see EMA_ZSCORE_ANALYSIS.md for why the old E[X²] formulation was
-        # algebraically unsafe under sustained mean drift.
+        # checkpointer (mirrors `score_bias`). Buffer registration is safe here
+        # because the EMA is only *read* in forward; updates happen in `post_batch`,
+        # outside any torch.compile traced region. Initialized to zero so Adam-style
+        # bias correction (1 / (1 - α^t)) yields unbiased mean / variance estimates
+        # from step 1 onwards.
+        #
+        # - `_ema_mean`: per-expert running estimate of the mean logit (Holt's ``ℓ``
+        #   when `ema_zscore_trend` is on, plain-EMA level otherwise).
+        # - `_ema_var`: per-expert running estimate of Var(logit), computed from the
+        #   sample-based observation `var_obs = sq_sum/count − (sum/count)²`. NOT
+        #   `E[X²]` — the old `E[X²]` formulation created an algebraic cancellation
+        #   with the mean-trend under sustained drift; see EMA_ZSCORE_ANALYSIS.md.
+        # - `_ema_step_count`: optimizer-step counter `t` used in the bias-correction
+        #   factor `1 - α^t`. Long-dtype so it never overflows.
         if self.ema_zscore_normalize:
             self.register_buffer(
                 "_ema_mean",
@@ -313,10 +330,11 @@ class MoERouter(nn.Module):
             self.register_buffer("_ema_var", None)
             self.register_buffer("_ema_step_count", None)
 
-        # Holt's trend companion for the MEAN only. Initialized to zero; the level
-        # update reduces to plain EMA when trend ≈ 0, so startup is graceful — no
-        # Adam-style bias correction needed for the trend buffer itself. Variance
-        # has no trend buffer by design.
+        # Holt's trend companion for the MEAN only (`b` in textbook notation) —
+        # per-expert running estimate of the per-step drift of `_ema_mean`.
+        # Initialized to zero; the level update reduces to plain EMA when trend ≈ 0,
+        # so startup is graceful — no Adam-style bias correction needed for the
+        # trend buffer itself. Variance has no trend buffer by design.
         if self.ema_zscore_trend:
             self.register_buffer(
                 "_ema_mean_trend",
@@ -574,15 +592,39 @@ class MoERouter(nn.Module):
     ) -> None:
         """
         One step of textbook undamped Holt's linear-trend smoothing, in-place on
-        ``level`` and ``trend``. Old-weight convention (α, β ∈ (0,1), close to 1 =
-        slow)::
+        ``level`` and ``trend``.
+
+        Meaning of each argument in *this* router's context — Holt's is applied to
+        the per-expert mean logit, so all three tensors are shape ``(num_experts,)``:
+
+        - ``level`` — running estimate of the per-expert mean logit *right now*
+          (Holt's symbol ``ℓ``). Equivalent to ``_ema_mean``.
+        - ``trend`` — running estimate of how much the per-expert mean logit is
+          drifting per optimizer step (Holt's ``b``). Equivalent to
+          ``_ema_mean_trend``. Zero when the mean is stationary; positive when the
+          logits are drifting up, negative when drifting down.
+        - ``observation`` — the current batch's per-expert sample mean (Holt's
+          ``y_t``), computed as ``sum / count`` over this step's tokens after the
+          distributed all-reduce.
+        - ``alpha`` — decay for ``level`` (old-weight convention, ≈1 = slow). At
+          α=0.99, ``level`` has ~100-step memory of its observations.
+        - ``beta`` — decay for ``trend`` (same convention). At β=0.9, ``trend``
+          has ~10-step memory of level-differences.
+
+        Update equations (Hyndman-style old-weight convention, α, β ∈ (0,1))::
 
             ℓ_t = α·(ℓ_{t-1} + b_{t-1}) + (1-α)·y_t
             b_t = β·b_{t-1}            + (1-β)·(ℓ_t - ℓ_{t-1})
 
-        Forecast at forward-time (h=1): ``ℓ_t + b_t`` — zero steady-state lag for
-        linear drift. Used for the mean only; variance uses plain EMA (see
-        EMA_ZSCORE_ANALYSIS.md for the asymmetry argument).
+        In words: the new level blends the previous level+trend forecast with the
+        current observation; the new trend blends the previous trend with the
+        actual change in level we just observed.
+
+        The 1-step-ahead forecast used at forward-time is ``ℓ_t + b_t`` — this has
+        zero steady-state lag for linearly-drifting input, which is why we can't
+        replace it with plain EMA for the mean (plain EMA has a 100-step lag at
+        α=0.99, which compounds into routing imbalance — see
+        EMA_ZSCORE_ANALYSIS.md). Used for the mean only; variance uses plain EMA.
         """
         old_level = level.clone()
         level.mul_(alpha).add_(trend, alpha=alpha).add_(observation, alpha=1.0 - alpha)
