@@ -331,10 +331,10 @@ def test_router_ema_microbatch_cadence(device: torch.device):
         assert router._ema_mean is not None and router._ema_var is not None
         return router._ema_mean.clone(), router._ema_var.clone()
 
-    mean_full, sq_full = _run(1)
-    mean_mb, sq_mb = _run(4)
+    mean_full, var_full = _run(1)
+    mean_mb, var_mb = _run(4)
     torch.testing.assert_close(mean_full, mean_mb)
-    torch.testing.assert_close(sq_full, sq_mb)
+    torch.testing.assert_close(var_full, var_mb)
 
 
 @pytest.mark.parametrize("device", DEVICES)
