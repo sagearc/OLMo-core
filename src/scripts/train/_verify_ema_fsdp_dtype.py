@@ -81,18 +81,18 @@ def main():
             f"  _ema_mean.dtype  = {router._ema_mean.dtype}, shape={tuple(router._ema_mean.shape)}, device={router._ema_mean.device}"
         )
         print(
-            f"  _ema_sq.dtype    = {router._ema_sq.dtype}, shape={tuple(router._ema_sq.shape)}, device={router._ema_sq.device}"
+            f"  _ema_var.dtype    = {router._ema_var.dtype}, shape={tuple(router._ema_var.shape)}, device={router._ema_var.device}"
         )
         print(
             f"  score_bias.dtype = {router.score_bias.dtype}, shape={tuple(router.score_bias.shape)}, device={router.score_bias.device}"
         )
 
-    print("\n=== Initial values (post-FSDP materialization) — should be (0, 1) and 0 ===")
+    print("\n=== Initial values (post-FSDP materialization) — all expect 0 ===")
     for layer_idx, block_mod in enumerate(train_module.model.blocks.values()):  # type: ignore
         router = block_mod.feed_forward_moe.router
         print(f"layer {layer_idx}:")
         print(f"  _ema_mean    : abs_max={router._ema_mean.abs().max().item():.6e} (expect 0)")
-        print(f"  _ema_sq      : value={router._ema_sq.tolist()} (expect ones)")
+        print(f"  _ema_var     : abs_max={router._ema_var.abs().max().item():.6e} (expect 0)")
         print(f"  score_bias   : abs_max={router.score_bias.abs().max().item():.6e} (expect 0)")
 
     print("\n=== Running one forward + post_batch directly on the wrapped model ===")
@@ -111,7 +111,7 @@ def main():
             f"  _ema_mean: dtype={router._ema_mean.dtype}, value_max={router._ema_mean.abs().max().item():.6e}"
         )
         print(
-            f"  _ema_sq:   dtype={router._ema_sq.dtype}, value_max={router._ema_sq.abs().max().item():.6e}"
+            f"  _ema_var:   dtype={router._ema_var.dtype}, value_max={router._ema_var.abs().max().item():.6e}"
         )
         print(
             f"  score_bias: dtype={router.score_bias.dtype}, value_max={router.score_bias.abs().max().item():.6e}"
@@ -119,7 +119,7 @@ def main():
 
     print("\n=== State_dict roundtrip check ===")
     sd = train_module.model.state_dict()
-    ema_keys = [k for k in sd.keys() if "_ema_mean" in k or "_ema_sq" in k]
+    ema_keys = [k for k in sd.keys() if "_ema_mean" in k or "_ema_var" in k]
     print(f"EMA keys in state_dict: {len(ema_keys)}")
     for k in ema_keys[:4]:
         print(f"  {k}: dtype={sd[k].dtype}, shape={tuple(sd[k].shape)}")

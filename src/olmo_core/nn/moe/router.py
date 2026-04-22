@@ -106,26 +106,43 @@ class MoERouterConfig(ModuleConfig):
     """
     ema_zscore_normalize: bool = False
     """
-    If True, z-normalize router logits per expert using an EMA of mean / squared-mean
-    before applying the gating function. Composes with both ``softmax`` and ``sigmoid``.
+    If True, z-normalize router logits per expert using EMA estimates of per-expert
+    mean and variance before applying the gating function. Composes with both
+    ``softmax`` and ``sigmoid``. The variance is tracked *directly* (via a
+    sample-mean-based observation), not reconstructed from ``E[X²] − E[X]²``.
+    See ``EMA_ZSCORE_ANALYSIS.md`` in this directory for the design rationale.
     """
     ema_zscore_alpha: float = 0.99
     """
-    EMA decay used when ``ema_zscore_normalize`` is enabled.
+    EMA decay used for the mean level and for the variance level.
     """
     ema_zscore_trend: bool = False
     """
-    If True, promote the EMA z-score stats to Holt's linear-trend (double exponential)
-    smoothing. Level update anticipates drift via ``ℓ_t = α·(ℓ_{t-1}+b_{t-1}) + (1-α)·y_t``;
-    trend is an EMA of per-step level diffs. Forecast at forward-time is ``ℓ+b`` (h=1),
-    which has zero steady-state lag for linear drift (vs. plain EMA's α/(1-α) lag).
-    Addresses forward-peaking from σ̂ underestimating σ_true during sustained drift.
+    If True, apply Holt's linear-trend smoothing (undamped) to the **mean only**.
+    Level update: ``ℓ_t = α·(ℓ_{t-1}+b_{t-1}) + (1-α)·y_t``. Forecast at forward-time
+    is ``ℓ+b`` (zero steady-state lag for linear drift, vs. plain EMA's α/(1-α) lag).
+    The variance is always smoothed with plain EMA — no trend — regardless of this
+    flag. This asymmetry is intentional: mean-bias feeds back through routing and
+    needs zero-lag tracking; variance-bias is second-order and plain EMA is strictly
+    safer (cannot drive ``σ̂²`` below zero).
     """
     ema_zscore_trend_beta: float = 0.9
     """
-    Trend-EMA old-weight (same convention as ``ema_zscore_alpha``). At 0.9: trend is
-    90% history + 10% new diff — textbook Holt's β*=0.1. Lower → more responsive,
-    noisier. Only used when ``ema_zscore_trend`` is enabled.
+    Trend-EMA old-weight for the mean's trend buffer (same convention as
+    ``ema_zscore_alpha``). At 0.9: trend is 90% history + 10% new diff — textbook
+    Holt's β*=0.1. Lower → more responsive, noisier. Only used when
+    ``ema_zscore_trend`` is enabled.
+    """
+    ema_zscore_trend_warmup: int = 1000
+    """
+    Hold the mean's trend buffer at zero (plain EMA + Adam-style bias correction)
+    for the first ``ema_zscore_trend_warmup`` optimizer steps, then switch to Holt's
+    forecast ``(ℓ + b) / (1 - α^t)``. Prevents the trend from fitting the non-linear
+    weight trajectory during LR warmup and then forecasting phantom drift afterwards.
+    Set to 0 to skip the plain-EMA phase (not recommended — the Holt level starts
+    from zero init and produces biased forecasts for ~``1/(1-α)`` steps until bc
+    converges). Only used when ``ema_zscore_trend`` is enabled. Does not affect the
+    variance, which is always plain EMA.
     """
     dtype: Optional[DType] = None
 
@@ -219,6 +236,7 @@ class MoERouter(nn.Module):
         ema_zscore_alpha: float = 0.99,
         ema_zscore_trend: bool = False,
         ema_zscore_trend_beta: float = 0.9,
+        ema_zscore_trend_warmup: int = 1000,
         lb_loss_weight: Optional[float] = None,
         lb_loss_granularity: MoELoadBalancingLossGranularity = MoELoadBalancingLossGranularity.local_batch,
         z_loss_weight: Optional[float] = None,
@@ -247,10 +265,14 @@ class MoERouter(nn.Module):
                 "ema_zscore_trend requires ema_zscore_normalize=True; it's a modifier "
                 "on the EMA path, not a standalone mode."
             )
-            assert 0.0 < ema_zscore_trend_beta < 1.0, (
-                f"ema_zscore_trend_beta must be in (0, 1), got {ema_zscore_trend_beta}."
-            )
+            assert (
+                0.0 < ema_zscore_trend_beta < 1.0
+            ), f"ema_zscore_trend_beta must be in (0, 1), got {ema_zscore_trend_beta}."
+            assert (
+                ema_zscore_trend_warmup >= 0
+            ), f"ema_zscore_trend_warmup must be >= 0, got {ema_zscore_trend_warmup}."
         self.ema_zscore_trend_beta = ema_zscore_trend_beta
+        self.ema_zscore_trend_warmup = ema_zscore_trend_warmup
         self.lb_loss_weight = lb_loss_weight
         self.lb_loss_granularity = lb_loss_granularity
         self.z_loss_weight = z_loss_weight
@@ -268,14 +290,17 @@ class MoERouter(nn.Module):
         # checkpointer (mirrors `score_bias`). Buffer registration is safe here because
         # the EMA is only *read* in forward; updates happen in `post_batch`, outside any
         # torch.compile traced region. Initialized to zero so Adam-style bias correction
-        # (1 / (1 - α^t)) yields unbiased mean / E[X²] estimates from step 1 onwards.
+        # (1 / (1 - α^t)) yields unbiased mean / variance estimates from step 1 onwards.
+        # `_ema_var` tracks Var(logit) directly from a sample-based observation, not
+        # `E[X²]` — see EMA_ZSCORE_ANALYSIS.md for why the old E[X²] formulation was
+        # algebraically unsafe under sustained mean drift.
         if self.ema_zscore_normalize:
             self.register_buffer(
                 "_ema_mean",
                 torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
             )
             self.register_buffer(
-                "_ema_sq",
+                "_ema_var",
                 torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
             )
             self.register_buffer(
@@ -284,23 +309,20 @@ class MoERouter(nn.Module):
             )
         else:
             self.register_buffer("_ema_mean", None)
-            self.register_buffer("_ema_sq", None)
+            self.register_buffer("_ema_var", None)
             self.register_buffer("_ema_step_count", None)
 
-        # Holt's trend companions. Initialized to zero; the level update reduces to plain
-        # EMA when trend ≈ 0, so startup is graceful — no bc-style correction needed.
+        # Holt's trend companion for the MEAN only. Initialized to zero; the level
+        # update reduces to plain EMA when trend ≈ 0, so startup is graceful — no
+        # bc-style correction needed for the trend buffer itself. Variance has no
+        # trend buffer by design.
         if self.ema_zscore_trend:
             self.register_buffer(
                 "_ema_mean_trend",
                 torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
             )
-            self.register_buffer(
-                "_ema_sq_trend",
-                torch.zeros(self.num_experts, dtype=torch.float32, device=init_device),
-            )
         else:
             self.register_buffer("_ema_mean_trend", None)
-            self.register_buffer("_ema_sq_trend", None)
 
         # NOTE: we don't use buffers for these because we don't want FSDP to manage them, and we
         # don't use a BufferCache because `torch.compile()` doesn't handle that well when we're modifying
@@ -341,17 +363,16 @@ class MoERouter(nn.Module):
             self._seq_aux_loss = hide_from_torch(torch.zeros([], device=self.device))
 
         if self.ema_zscore_normalize:
-            assert self._ema_mean is not None and self._ema_sq is not None
+            assert self._ema_mean is not None and self._ema_var is not None
             assert self._ema_step_count is not None
             cast(torch.Tensor, self._ema_mean).zero_()
-            cast(torch.Tensor, self._ema_sq).zero_()
+            cast(torch.Tensor, self._ema_var).zero_()
             cast(torch.Tensor, self._ema_step_count).zero_()
             self._ema_logit_sum_accum = None
             self._ema_logit_sq_sum_accum = None
             if self.ema_zscore_trend:
-                assert self._ema_mean_trend is not None and self._ema_sq_trend is not None
+                assert self._ema_mean_trend is not None
                 cast(torch.Tensor, self._ema_mean_trend).zero_()
-                cast(torch.Tensor, self._ema_sq_trend).zero_()
             self._ema_token_count_accum = 0
 
     @property
@@ -465,11 +486,11 @@ class MoERouter(nn.Module):
 
         # ---- EMA z-score per-step update ------------------------------------------------
         if self.ema_zscore_normalize and self._ema_logit_sum_accum is not None:
-            assert self._ema_mean is not None and self._ema_sq is not None
+            assert self._ema_mean is not None and self._ema_var is not None
             assert self._ema_step_count is not None
             assert self._ema_logit_sq_sum_accum is not None
             ema_mean = cast(torch.Tensor, self._ema_mean)
-            ema_sq = cast(torch.Tensor, self._ema_sq)
+            ema_var = cast(torch.Tensor, self._ema_var)
             ema_step = cast(torch.Tensor, self._ema_step_count)
             local_sum = unhide_from_torch(self._ema_logit_sum_accum)
             local_sq = unhide_from_torch(self._ema_logit_sq_sum_accum)
@@ -486,25 +507,30 @@ class MoERouter(nn.Module):
 
             global_mean = local_sum / local_count
             global_sq = local_sq / local_count
+            # Sample-mean-based variance observation: var_obs = (1/n) Σ (x_i − x̄)².
+            # Unbiased of the forecast μ̂, so smoothing it cannot leak forecast error
+            # into σ̂ (which was the failure mode in the old E[X²] formulation).
+            global_var = global_sq - global_mean.pow(2)
 
             if not dry_run:
                 alpha = self.ema_zscore_alpha
-                if self.ema_zscore_trend:
-                    assert self._ema_mean_trend is not None and self._ema_sq_trend is not None
+                # During the first `ema_zscore_trend_warmup` steps, weights move
+                # non-linearly (LR warmup regime) — fitting Holt's trend here makes
+                # it memorize noise and forecast phantom drift. Run plain EMA + bc
+                # until then; trend buffer stays zero, so the forecast `ℓ + b = ℓ`
+                # matches plain-EMA output at the transition step (seamless switch).
+                # Trend applies to the MEAN only; variance is always plain EMA.
+                use_trend = (
+                    self.ema_zscore_trend and ema_step.item() >= self.ema_zscore_trend_warmup
+                )
+                if use_trend:
+                    assert self._ema_mean_trend is not None
                     beta = self.ema_zscore_trend_beta
                     mean_trend = cast(torch.Tensor, self._ema_mean_trend)
-                    sq_trend = cast(torch.Tensor, self._ema_sq_trend)
-                    if ema_step.item() == 0:
-                        # Seed level from first batch instead of the zero init;
-                        # plain-EMA+bc sidesteps this via division, Holt's can't.
-                        ema_mean.copy_(global_mean)
-                        ema_sq.copy_(global_sq)
-                    else:
-                        self._holt_update(ema_mean, mean_trend, global_mean, alpha, beta)
-                        self._holt_update(ema_sq, sq_trend, global_sq, alpha, beta)
+                    self._holt_update(ema_mean, mean_trend, global_mean, alpha, beta)
                 else:
-                    ema_mean.mul_(alpha).add_(global_mean, alpha=1.0 - alpha)
-                    ema_sq.mul_(alpha).add_(global_sq, alpha=1.0 - alpha)
+                    ema_mean.lerp_(global_mean, 1.0 - alpha)
+                ema_var.lerp_(global_var, 1.0 - alpha)
                 ema_step.add_(1)  # tracks t for Adam-style bias correction in forward
 
             # Reset accumulators whether or not we applied the update — never leak.
@@ -521,15 +547,16 @@ class MoERouter(nn.Module):
         beta: float,
     ) -> None:
         """
-        One step of textbook Holt's linear-trend smoothing, in-place on ``level`` and
-        ``trend``. Old-weight convention (α, β ∈ (0,1), close to 1 = slow)::
+        One step of textbook undamped Holt's linear-trend smoothing, in-place on
+        ``level`` and ``trend``. Old-weight convention (α, β ∈ (0,1), close to 1 =
+        slow)::
 
             ℓ_t = α·(ℓ_{t-1} + b_{t-1}) + (1-α)·y_t
             b_t = β·b_{t-1}            + (1-β)·(ℓ_t - ℓ_{t-1})
 
-        Forecast at forward-time (h=1): ``ℓ_t + b_t`` — lag-free for linear drift at
-        steady state. Startup transient has complex eigenvalues (|λ| = √α); at α=0.99
-        it takes ~1/(1-√α) ≈ 200 steps of oscillatory decay to settle.
+        Forecast at forward-time (h=1): ``ℓ_t + b_t`` — zero steady-state lag for
+        linear drift. Used for the mean only; variance uses plain EMA (see
+        EMA_ZSCORE_ANALYSIS.md for the asymmetry argument).
         """
         old_level = level.clone()
         level.mul_(alpha).add_(trend, alpha=alpha).add_(obs, alpha=1.0 - alpha)
@@ -537,50 +564,59 @@ class MoERouter(nn.Module):
 
     def _bias_corrected_ema_stats(self, step: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Return the per-expert forecasted mean and std that :meth:`_apply_ema_zscore` uses
-        to normalize router logits.
+        Return the per-expert forecasted mean and std that :meth:`_apply_ema_zscore`
+        uses to normalize router logits.
 
-        Plain-EMA path: Adam-style bias correction ``1 / (1 - α^t)``.
-        Holt's-trend path: 1-step-ahead forecast ``ℓ + b`` — lag-free for linear drift,
-        no Adam-style bc (the trend-aware level update makes the level itself unbiased).
+        Adam-style bias correction ``1 / (1 - α^t)`` is applied on every path. For
+        the Holt path this also corrects the zero-init bias of the level (``ℓ`` is
+        scaled by ``1 - α^t`` early on) and has negligible effect once
+        ``t ≫ 1/(1-α)``, where it fades to 1. Applying bc here makes the transition
+        at ``step == warmup`` exactly continuous, since the trend starts at 0 so
+        ``(ℓ + 0)/bc = ℓ/bc`` matches the plain-EMA forecast.
+
+        Mean path:
+            plain EMA (step < warmup or trend disabled):  ``μ̂ = ℓ_μ / (1 - α^t)``
+            Holt's    (step ≥ warmup):                    ``μ̂ = (ℓ_μ + b_μ) / (1 - α^t)``
+
+        Variance path (always plain EMA):                 ``σ̂² = ℓ_var / (1 - α^t)``
 
         Caller must ensure ``step > 0`` (for ``t=0`` the EMA is uninitialized).
         """
-        assert self._ema_mean is not None and self._ema_sq is not None
+        assert self._ema_mean is not None and self._ema_var is not None
         ema_mean = cast(torch.Tensor, self._ema_mean)
-        ema_sq = cast(torch.Tensor, self._ema_sq)
-        if self.ema_zscore_trend:
-            assert self._ema_mean_trend is not None and self._ema_sq_trend is not None
+        ema_var = cast(torch.Tensor, self._ema_var)
+        bc = 1.0 - (self.ema_zscore_alpha**step)
+        if self.ema_zscore_trend and step >= self.ema_zscore_trend_warmup:
+            assert self._ema_mean_trend is not None
             mean_trend = cast(torch.Tensor, self._ema_mean_trend)
-            sq_trend = cast(torch.Tensor, self._ema_sq_trend)
-            mean_hat = ema_mean + mean_trend
-            sq_hat = ema_sq + sq_trend
+            mean_hat = (ema_mean + mean_trend) / bc
         else:
-            bc = 1.0 - (self.ema_zscore_alpha**step)
             mean_hat = ema_mean / bc
-            sq_hat = ema_sq / bc
-        # Std floor of 1e-2 (clamp on var = 1e-4) keeps `(logits - μ) / σ` from
-        # blowing up to Inf under bf16 if the EMA variance ever collapses (e.g.
-        # immediately post-checkpoint-load before stats refill, or transient
-        # collapse during init). On the Holt's path, the clamp also absorbs brief
-        # `sq_hat < mean_hat²` excursions from trend overshoots on sq.
-        ema_std = (sq_hat - mean_hat.pow(2)).clamp(min=1e-4).sqrt()
+        # Std floor of 1e-2 (clamp on var = 1e-4) is a belt-and-suspenders safety:
+        # under the direct-Var formulation it cannot be driven below the minimum
+        # observed Var (EMA is a convex combination of non-negative observations),
+        # so the floor should only trigger on genuine variance collapse — e.g.
+        # immediately post-checkpoint-load before stats refill. If you see it
+        # trigger during training, something upstream is wrong.
+        ema_std = (ema_var / bc).clamp(min=1e-4).sqrt()
         return mean_hat, ema_std
 
     def _apply_ema_zscore(self, logits: torch.Tensor) -> torch.Tensor:
         """
-        Z-normalize ``logits`` per expert using the EMA snapshot from the previous optimizer
-        step, then accumulate raw stats (sum, sum-of-squares, token count) so that
-        :meth:`post_batch` can apply a single EMA update per step. Gradient flows through
-        ``logits`` only — EMA buffers and accumulators are detached.
+        Z-normalize ``logits`` per expert using the EMA snapshot from the previous
+        optimizer step, then accumulate raw stats (sum, sum-of-squares, token count)
+        so that :meth:`post_batch` can compute the sample-based variance observation
+        ``var_obs = sq_sum/count − (sum/count)²`` and apply a single EMA update per
+        step. Gradient flows through ``logits`` only — EMA buffers and accumulators
+        are detached.
 
         The EMA snapshot is constant across all microbatches within a step, so all
-        microbatches see identical ``μ``, ``σ``. This makes the per-step EMA decay
+        microbatches see identical ``μ̂``, ``σ̂``. This makes the per-step EMA decay
         unambiguous (one ``α``-update per optimizer step, not per microbatch).
 
-        Adam-style bias correction (``/ (1 - α^t)``) is applied so that the EMA gives
-        unbiased mean / ``E[X²]`` estimates from step 1 onwards, instead of taking
-        ~``1/(1-α)`` steps to ramp up from the zero init.
+        Adam-style bias correction (``/ (1 - α^t)``) is applied so that the EMA
+        gives unbiased mean / variance estimates from step 1 onwards, instead of
+        taking ~``1/(1-α)`` steps to ramp up from the zero init.
 
         Step ``t = 0`` (no stats yet) returns ``logits`` unchanged — the very first
         forward sees raw logits, which is acceptable for one batch and avoids
@@ -725,6 +761,7 @@ class MoERouter(nn.Module):
             for i in range(mean_hat.shape[0]):
                 out[f"expert {i:02d}/ema mean"] = (mean_hat[i], ReduceType.mean)
                 out[f"expert {i:02d}/ema std"] = (ema_std[i], ReduceType.mean)
+            out["ema step"] = (ema_step.float(), ReduceType.mean)
 
         if reset:
             self.reset_metrics()
