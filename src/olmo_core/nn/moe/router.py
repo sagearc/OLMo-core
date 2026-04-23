@@ -76,10 +76,20 @@ class MoERouterType(StrEnum):
     ➡️ :class:`MoELinearRouter`
     """
 
+    centroid = "centroid"
+    """
+    ➡️ :class:`MoECentroidRouter`
+    """
+
 
 class MoERouterGatingFunction(StrEnum):
     softmax = "softmax"
     sigmoid = "sigmoid"
+    identity = "identity"
+    """
+    Pass scores through unchanged. Used by :class:`MoECentroidRouter` where cosine
+    similarity is already in ``[-1, 1]`` and needs no further nonlinearity.
+    """
 
 
 @dataclass
@@ -98,6 +108,34 @@ class MoERouterConfig(ModuleConfig):
     uniform_expert_assignment: bool = False
     bias_gamma: Optional[float] = None
     gating_function: MoERouterGatingFunction = MoERouterGatingFunction.softmax
+    centroid_alpha: float = 0.99
+    """
+    Static EMA decay for :class:`MoECentroidRouter` centroid tracking. Used when
+    ``name == MoERouterType.centroid`` and ``centroid_lr_lambda`` is ``None``.
+    """
+    centroid_lr_lambda: Optional[float] = None
+    """
+    When set, replaces the static ``centroid_alpha`` with a learning-rate-coupled rate:
+
+    .. math::
+
+        1 - \\alpha_t = \\lambda_{\\text{EMA}} \\cdot \\eta_t
+
+    so the centroid step size tracks the optimizer's current LR and decays
+    naturally with the cosine schedule.  ``centroid_alpha`` is ignored when
+    this is set.  Only used when ``name == MoERouterType.centroid``.
+    """
+    bias_lr_lambda: Optional[float] = None
+    """
+    When set, replaces the static ``bias_gamma`` with a learning-rate-coupled rate:
+
+    .. math::
+
+        \\gamma_t = \\lambda_{\\text{bias}} \\cdot \\eta_t
+
+    so the dual ascent step size also decays with the LR schedule.
+    ``bias_gamma`` is ignored when this is set.
+    """
     seq_aux_loss_weight: Optional[float] = None
     """
     If set, enables the DeepSeek-v3 complementary sequence-wise auxiliary loss
@@ -189,7 +227,7 @@ class MoERouterConfig(ModuleConfig):
         num_params = 0
         if self.name == MoERouterType.default:
             num_params += d_model * num_experts
-        else:
+        elif self.name != MoERouterType.centroid:
             raise NotImplementedError
 
         return num_params
@@ -230,6 +268,8 @@ class MoERouterConfig(ModuleConfig):
         try:
             if self.name == MoERouterType.default:
                 return MoELinearRouter(**kwargs)
+            elif self.name == MoERouterType.centroid:
+                return MoECentroidRouter(**kwargs)
             else:
                 raise NotImplementedError(self.name)
         except TypeError as e:
@@ -264,6 +304,7 @@ class MoERouter(nn.Module):
         normalize_expert_weights: Optional[float] = None,
         uniform_expert_assignment: bool = False,
         bias_gamma: Optional[float] = None,
+        bias_lr_lambda: Optional[float] = None,
         gating_function: MoERouterGatingFunction = MoERouterGatingFunction.softmax,
         seq_aux_loss_weight: Optional[float] = None,
         ema_zscore_normalize: bool = False,
@@ -285,6 +326,7 @@ class MoERouter(nn.Module):
         self.normalize_expert_weights = normalize_expert_weights
         self.uniform_expert_assignment = uniform_expert_assignment
         self.bias_gamma = bias_gamma
+        self.bias_lr_lambda = bias_lr_lambda
         self.gating_function = gating_function
         self.seq_aux_loss_weight = seq_aux_loss_weight
         self.ema_zscore_normalize = ema_zscore_normalize
@@ -319,8 +361,9 @@ class MoERouter(nn.Module):
         self.cp_mesh: Optional[dist.DeviceMesh] = None
         self.tp_mesh: Optional[dist.DeviceMesh] = None
 
-        if self.bias_gamma is not None:
-            assert self.bias_gamma > 0
+        if self.bias_gamma is not None or self.bias_lr_lambda is not None:
+            if self.bias_gamma is not None:
+                assert self.bias_gamma > 0
             self.register_buffer("score_bias", torch.zeros(self.num_experts, device=init_device))
         else:
             self.register_buffer("score_bias", None)
@@ -410,7 +453,7 @@ class MoERouter(nn.Module):
             torch.zeros(self.num_experts, device=self.device)
         )
 
-        if self.bias_gamma is not None:
+        if self.bias_gamma is not None or self.bias_lr_lambda is not None:
             assert self.score_bias is not None
             score_bias = cast(torch.Tensor, self.score_bias)
             score_bias.zero_()
@@ -447,7 +490,7 @@ class MoERouter(nn.Module):
 
     @property
     def score_bias_batch_size_per_expert(self) -> Optional[torch.Tensor]:
-        if self.bias_gamma is not None:
+        if self.bias_gamma is not None or self.bias_lr_lambda is not None:
             if self._score_bias_batch_size_per_expert is None:
                 self._score_bias_batch_size_per_expert = hide_from_torch(
                     torch.zeros(self.num_experts, device=self.device)
@@ -520,12 +563,18 @@ class MoERouter(nn.Module):
         self._seq_aux_loss = hide_from_torch(value)
 
     @torch.no_grad()
-    def post_batch(self, dry_run: bool = False):
+    def post_batch(self, dry_run: bool = False, lr: Optional[float] = None):
         if not self.training:
             return
 
         # ---- DeepSeek bias-rule update --------------------------------------------------
-        if self.bias_gamma is not None:
+        effective_gamma: Optional[float]
+        if self.bias_lr_lambda is not None and lr is not None:
+            effective_gamma = self.bias_lr_lambda * lr
+        else:
+            effective_gamma = self.bias_gamma
+
+        if effective_gamma is not None:
             assert self.score_bias is not None
             assert self.score_bias_batch_size_per_expert is not None
             score_bias = cast(torch.Tensor, self.score_bias)
@@ -539,7 +588,7 @@ class MoERouter(nn.Module):
                 dim=0, keepdim=True, dtype=torch.float32
             )
             bias_delta = (
-                self.bias_gamma * (ideal_batch_size_per_expert - batch_size_per_expert).sign()
+                effective_gamma * (ideal_batch_size_per_expert - batch_size_per_expert).sign()
             )
             # NOTE: have to be careful here to manage the case where `score_bias` is a DTensor.
             bias_delta = distribute_like(score_bias, bias_delta)
@@ -780,7 +829,7 @@ class MoERouter(nn.Module):
     def get_top_k(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         expert_weights: torch.Tensor
         expert_indices: torch.Tensor
-        if self.bias_gamma is None:
+        if self.bias_gamma is None and self.bias_lr_lambda is None:
             if self.top_k == 1:
                 expert_weights, expert_indices = scores.max(dim=-1, keepdim=True)
             else:
@@ -918,6 +967,8 @@ class MoERouter(nn.Module):
             scores = gating_logits.softmax(dim=-1)
         elif self.gating_function == MoERouterGatingFunction.sigmoid:
             scores = F.sigmoid(gating_logits) + 1e-7
+        elif self.gating_function == MoERouterGatingFunction.identity:
+            scores = gating_logits
         else:
             raise NotImplementedError(self.gating_function)
 
@@ -1003,7 +1054,7 @@ class MoERouter(nn.Module):
                     aux_loss = scaled_seq_aux if aux_loss is None else aux_loss + scaled_seq_aux
 
             self.batch_size_per_expert += batch_size_per_expert
-            if self.bias_gamma is not None:
+            if self.bias_gamma is not None or self.bias_lr_lambda is not None:
                 assert self.score_bias_batch_size_per_expert is not None
                 self.score_bias_batch_size_per_expert += batch_size_per_expert
 
@@ -1090,3 +1141,223 @@ class MoELinearRouter(MoERouter):
         self.register_parameter(
             "weight", nn.Parameter(distribute_tensor(self.weight, tp_mesh, [Replicate()]))
         )
+
+
+class MoECentroidRouter(MoERouter):
+    """
+    Gradient-free EMA centroid router implementing the primal-dual algorithm for
+    capacity-constrained online clustering (see paper §3).
+
+    Each expert ``k`` maintains a centroid ``c_k ∈ R^{d_model}`` that tracks the
+    running mean of hidden states routed to it.  Routing scores are cosine
+    similarities between the current token representation and the bias-corrected
+    centroids.  No gradient ever flows into ``c_k`` — it is a pure statistic.
+
+    **Primal update** (centroid tracking, M-step):
+
+    .. code-block::
+
+        c_k  ←  α·c_k + (1-α)·mean_{assigned}(h(x))   [only for experts with tokens]
+
+    **Dual update** (load-balancing, via ``bias_gamma``):
+
+    .. code-block::
+
+        b_k  ←  b_k + γ·sign(τ - f_k)
+
+    where ``τ = 1/K`` is the target token fraction and ``f_k`` is the measured
+    fraction.  This is the subgradient step on the Lagrange multiplier for the
+    uniform-coverage constraint in the Lagrangian (see paper §3.2).
+
+    Together they implement alternating primal-dual optimisation on:
+
+    .. math::
+
+        \\max_{Z,C} \\mathbb{E}_x\\bigl[\\sum_k z_k(x)\\cos(h(x), c_k)\\bigr]
+        \\quad \\text{s.t.} \\quad \\mathbb{E}_x[z_k(x)] = \\tau \\;\\forall k
+
+    without any auxiliary loss term and without any inter-centroid gradient
+    coupling.
+    """
+
+    def __init__(
+        self,
+        *,
+        centroid_alpha: float = 0.99,
+        centroid_lr_lambda: Optional[float] = None,
+        init_device: str = "cpu",
+        **kwargs,
+    ):
+        assert 0.0 < centroid_alpha < 1.0, (
+            f"centroid_alpha must be in (0, 1), got {centroid_alpha}."
+        )
+        super().__init__(init_device=init_device, **kwargs)
+        self.centroid_alpha = centroid_alpha
+        self.centroid_lr_lambda = centroid_lr_lambda
+
+        # Centroids: shape (num_experts, d_model).  Zero-init; bias correction
+        # ``1/(1-α^t)`` yields meaningful cosine similarities from step 1.
+        self.register_buffer(
+            "_centroid",
+            torch.zeros(self.num_experts, self.d_model, dtype=torch.float32, device=init_device),
+        )
+        self.register_buffer(
+            "_centroid_step",
+            torch.zeros((), dtype=torch.long, device=init_device),
+        )
+        # Accumulators reset each optimizer step.  Hidden from torch so FSDP
+        # and torch.compile don't manage them.
+        self._centroid_sum_accum: Optional[_HiddenTensor] = None
+        self._centroid_count_accum: Optional[_HiddenTensor] = None
+        # Python shadow of _centroid_step to avoid device→host syncs on the
+        # forward hot path.
+        self._centroid_step_py: int = 0
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        if self._centroid_step is not None:
+            self._centroid_step_py = int(cast(torch.Tensor, self._centroid_step).item())
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        if self._centroid is not None:
+            cast(torch.Tensor, self._centroid).zero_()
+        if self._centroid_step is not None:
+            cast(torch.Tensor, self._centroid_step).zero_()
+        self._centroid_step_py = 0
+        self._centroid_sum_accum = None
+        self._centroid_count_accum = None
+
+    @property
+    def device(self) -> torch.device:
+        centroid = cast(torch.Tensor, self._centroid)
+        return centroid.device if centroid.device.type != "meta" else torch.device("cpu")
+
+    def get_expert_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Cosine similarity between each token and each bias-corrected centroid.
+
+        At step 0 (no observations yet) returns zeros so all experts are equally
+        likely and the first batch seeds the centroids without any NaN from
+        dividing a zero centroid.
+
+        :returns: Cosine similarities of shape ``(*, num_experts)`` in ``[-1, 1]``.
+        """
+        step = self._centroid_step_py
+        if step == 0:
+            shape = x.shape[:-1] + (self.num_experts,)
+            return torch.zeros(shape, dtype=torch.float32, device=x.device)
+
+        centroid = cast(torch.Tensor, self._centroid)
+        flat = x.float().view(-1, self.d_model)
+        # F.normalize handles zero-norm rows gracefully (returns zeros).
+        # Bias-correction (1/(1-α^t)) cancels in cosine similarity, so normalise directly.
+        h_norm = F.normalize(flat, dim=-1)
+        c_norm = F.normalize(centroid, dim=-1)
+        cos_sim = h_norm @ c_norm.t()
+        return cos_sim.view(*x.shape[:-1], self.num_experts)
+
+    @torch.no_grad()
+    def _accumulate_centroid(self, flat_h: torch.Tensor, expert_indices: torch.Tensor) -> None:
+        """
+        Accumulate hidden-state sums and token counts per expert for this microbatch.
+
+        :param flat_h: Raw hidden states, shape ``(N, d_model)``, float32.
+        :param expert_indices: Assignment indices, shape ``(N, top_k)``.
+        """
+        N, d = flat_h.shape
+        K = self.num_experts
+        # Repeat each token's hidden state for each of its top_k assignments.
+        h_rep = flat_h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(N * self.top_k, d)
+        idx = expert_indices.reshape(-1).long()
+
+        centroid_sum = torch.zeros(K, d, dtype=torch.float32, device=flat_h.device)
+        centroid_count = torch.zeros(K, dtype=torch.float32, device=flat_h.device)
+        centroid_sum.index_add_(0, idx, h_rep)
+        centroid_count.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+
+        if self._centroid_sum_accum is None:
+            self._centroid_sum_accum = hide_from_torch(centroid_sum)
+            self._centroid_count_accum = hide_from_torch(centroid_count)
+        else:
+            unhide_from_torch(self._centroid_sum_accum).add_(centroid_sum)
+            unhide_from_torch(self._centroid_count_accum).add_(centroid_count)
+
+    @torch.no_grad()
+    def post_batch(self, dry_run: bool = False, lr: Optional[float] = None) -> None:
+        # Dual update: bias rule from base class.
+        super().post_batch(dry_run=dry_run, lr=lr)
+
+        # Primal update: EMA centroid step.
+        if self._centroid_sum_accum is None:
+            return
+
+        if self.centroid_lr_lambda is not None and lr is not None:
+            alpha = 1.0 - self.centroid_lr_lambda * lr
+        else:
+            alpha = self.centroid_alpha
+
+        centroid = cast(torch.Tensor, self._centroid)
+        centroid_step = cast(torch.Tensor, self._centroid_step)
+        sum_accum = unhide_from_torch(self._centroid_sum_accum)
+        count_accum = unhide_from_torch(self._centroid_count_accum)
+
+        if is_distributed():
+            dist.all_reduce(sum_accum, group=self.group)
+            dist.all_reduce(count_accum, group=self.group)
+
+        has_tokens = count_accum > 0
+        if has_tokens.any() and not dry_run:
+            obs_mean = sum_accum[has_tokens] / count_accum[has_tokens].unsqueeze(-1)
+            # Only update centroids that received tokens this step; cold centroids
+            # keep their current value intact (no spurious decay toward zero).
+            centroid[has_tokens].lerp_(obs_mean, 1.0 - alpha)
+            centroid_step.add_(1)
+            self._centroid_step_py += 1
+
+        self._centroid_sum_accum = None
+        self._centroid_count_accum = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        loss_div_factor: Optional[Union[torch.Tensor, float]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        expert_weights, expert_indices, batch_size_per_expert, aux_loss = super().forward(
+            x, loss_div_factor=loss_div_factor
+        )
+        # Accumulate hidden states per assigned expert for the primal centroid update.
+        if self.training and torch.is_grad_enabled():
+            with torch.no_grad():
+                flat_h = x.view(-1, self.d_model).float()
+                self._accumulate_centroid(flat_h, expert_indices.view(-1, self.top_k))
+        return expert_weights, expert_indices, batch_size_per_expert, aux_loss
+
+    def reset_metrics(self):
+        super().reset_metrics()
+        self._centroid_sum_accum = None
+        self._centroid_count_accum = None
+
+    @torch.no_grad()
+    def compute_metrics(
+        self, reset: bool = True
+    ) -> Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]]:
+        from olmo_core.train.common import ReduceType
+
+        out = super().compute_metrics(reset=False)
+        step = self._centroid_step_py
+        if step > 0:
+            centroid = cast(torch.Tensor, self._centroid)
+            bc = 1.0 - self.centroid_alpha**step
+            centroid_hat = centroid / bc
+            norms = centroid_hat.norm(dim=-1)
+            for i in range(norms.shape[0]):
+                out[f"expert {i:02d}/centroid norm"] = (norms[i], ReduceType.mean)
+        out["centroid step"] = (
+            cast(torch.Tensor, self._centroid_step).float(),
+            ReduceType.mean,
+        )
+        if reset:
+            self.reset_metrics()
+        return out

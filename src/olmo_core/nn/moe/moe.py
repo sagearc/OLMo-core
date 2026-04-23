@@ -203,11 +203,11 @@ class MoEBase(nn.Module):
     def reset_metrics(self):
         self.router.reset_metrics()
 
-    def post_batch(self, dry_run: bool = False):
+    def post_batch(self, dry_run: bool = False, lr: Optional[float] = None):
         """
         Should be called right after the final backward of a complete batch but before the optimizer step.
         """
-        self.router.post_batch(dry_run=dry_run)
+        self.router.post_batch(dry_run=dry_run, lr=lr)
 
     @abstractmethod
     def _init_parallel_mlp(

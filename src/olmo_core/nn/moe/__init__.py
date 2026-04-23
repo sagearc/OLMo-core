@@ -6,6 +6,7 @@ from .loss import MoELoadBalancingLossGranularity
 from .mlp import DroplessMoEMLP, MoEMLP
 from .moe import DroplessMoE, MoEBase, MoEConfig, MoEType
 from .router import (
+    MoECentroidRouter,
     MoELinearRouter,
     MoERouter,
     MoERouterConfig,
@@ -22,6 +23,7 @@ __all__ = [
     "DroplessMoEMLP",
     "MoERouter",
     "MoELinearRouter",
+    "MoECentroidRouter",
     "MoERouterConfig",
     "MoERouterType",
     "MoERouterGatingFunction",

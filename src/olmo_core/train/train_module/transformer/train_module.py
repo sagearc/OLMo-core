@@ -423,7 +423,8 @@ class TransformerTrainModule(TrainModule):
 
         del batch  # In case this helps with memory utilization.
 
-        self.model.post_batch(dry_run=dry_run)
+        current_lr = self.optim.param_groups[0]["lr"]
+        self.model.post_batch(dry_run=dry_run, lr=current_lr)
 
         if dry_run:
             self.model.reset_auxiliary_metrics()

@@ -917,11 +917,11 @@ class Transformer(nn.Module):
             flops_per_token += self.lm_head.num_flops_per_token(seq_len)
         return flops_per_token
 
-    def post_batch(self, dry_run: bool = False):
+    def post_batch(self, dry_run: bool = False, lr: Optional[float] = None):
         """
         Should be called right after the final backward of a complete batch but before the optimizer step.
         """
-        del dry_run
+        del dry_run, lr
 
     def post_optim_step(self):
         """
@@ -1120,12 +1120,12 @@ class MoETransformer(Transformer):
                 world_mesh=world_mesh,
             )
 
-    def post_batch(self, dry_run: bool = False):
+    def post_batch(self, dry_run: bool = False, lr: Optional[float] = None):
         for block in self.blocks.values():
             if not block.is_moe:
                 continue
             block = cast(MoETransformerBlock, block)
-            block.feed_forward_moe.post_batch(dry_run=dry_run)
+            block.feed_forward_moe.post_batch(dry_run=dry_run, lr=lr)
 
 
 def _hide_cpu_inputs_from_torch(m, args, kwargs) -> Optional[Tuple[Any, Dict[str, Any]]]:

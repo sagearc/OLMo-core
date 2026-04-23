@@ -30,6 +30,9 @@ Usage:
         ema_trend_damped  as `ema_trend`, with Gardner-McKenzie damping φ=0.9 on the trend —
                           implicit gradient-suppression regularizer on μ̂ magnitude at cost
                           of ~0.4σ routing centering bias
+        ema_centroid      gradient-free EMA centroid routing + dual bias — primal-dual
+                          algorithm for capacity-constrained clustering; no router params,
+                          no aux losses, zero inter-centroid gradient coupling
 """
 
 import sys
@@ -46,7 +49,7 @@ from olmo_core.data import (
 )
 from olmo_core.data.numpy_dataset import NumpyDatasetConfig
 from olmo_core.distributed.parallel import DataParallelType
-from olmo_core.nn.moe import MoEConfig, MoERouterGatingFunction
+from olmo_core.nn.moe import MoEConfig, MoERouterGatingFunction, MoERouterType
 from olmo_core.nn.transformer import TransformerBlockConfig, TransformerConfig
 from olmo_core.optim import AdamWConfig, CosWithWarmup, OptimGroupOverride
 from olmo_core.train import (
@@ -123,6 +126,8 @@ class RoutingVariant(StrEnum):
     ema = "ema"
     ema_trend = "ema_trend"
     ema_trend_damped = "ema_trend_damped"
+    ema_trend_bias = "ema_trend_bias"
+    ema_centroid = "ema_centroid"
 
 
 def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
@@ -195,6 +200,47 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.router.ema_zscore_trend = True
         moe.router.ema_zscore_trend_beta = 0.9
         moe.router.ema_zscore_trend_damping = 0.9
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_trend_bias:
+        # `ema_trend` + DeepSeek's bias rule (arXiv:2408.15664 §4). z-norm + Holt's
+        # handle the first-two-moment stability (mean/scale per expert), the bias
+        # rule handles the token-count direction that z-norm is blind to: z-norm
+        # equalizes moments 1–2 but not tail shape, so top-k selection count can
+        # still drift. `score_bias_e ← score_bias_e + γ·sign(ideal − actual)` is
+        # added to scores before top-k (NOT to gather weights), γ=1e-3 per §4.3.
+        # Unlike the DeepSeek recipe this keeps SOFTMAX + no L1 renorm — the
+        # question is whether bias-rule-for-LI composes with softmax+z-norm+Holt's
+        # for a fully aux-loss-free MoE.
+        moe.router.ema_zscore_normalize = True
+        moe.router.ema_zscore_alpha = 0.99
+        moe.router.ema_zscore_trend = True
+        moe.router.ema_zscore_trend_beta = 0.9
+        moe.router.bias_gamma = 1e-3
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_centroid:
+        # Primal-dual algorithm for capacity-constrained online clustering (paper §3).
+        #
+        # Primal (M-step): c_k ← α_t·c_k + (1-α_t)·mean_{assigned}(h)
+        #   Step size (1-α_t) = centroid_lr_lambda · η_t is tied to the optimizer LR,
+        #   so centroid drift scales with the network's gradient step size and naturally
+        #   cools down with the cosine schedule. Zero inter-centroid coupling.
+        #
+        # Dual (Lagrange multiplier): b_k ← b_k + γ_t·sign(1/K - f_k)
+        #   γ_t = bias_lr_lambda · η_t — enforces uniform coverage at the same scale
+        #   as the gradient steps, preventing oscillation in the late training regime.
+        #
+        # Scores: cos(h, c_k) + b_k, top-k selection, identity weights (no softmax).
+        # No auxiliary losses, no router weight parameters, no static hyperparameters.
+        moe.router.name = MoERouterType.centroid
+        moe.router.centroid_lr_lambda = 1.0
+        moe.router.bias_lr_lambda = 2.0
+        moe.router.gating_function = MoERouterGatingFunction.identity
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
