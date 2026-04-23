@@ -1266,8 +1266,6 @@ class MoECentroidRouter(MoERouter):
     @torch.no_grad()
     def _accumulate_centroid(self, flat_h: torch.Tensor, expert_indices: torch.Tensor) -> None:
         """
-        Accumulate hidden-state sums and token counts per expert for this microbatch.
-
         :param flat_h: Raw hidden states, shape ``(N, d_model)``, float32.
         :param expert_indices: Assignment indices, shape ``(N, top_k)``.
         """
@@ -1291,7 +1289,7 @@ class MoECentroidRouter(MoERouter):
 
     @torch.no_grad()
     def post_batch(self, dry_run: bool = False, lr: Optional[float] = None) -> None:
-        # Dual update: bias rule from base class.
+        # Dual update (score_bias rule).
         super().post_batch(dry_run=dry_run, lr=lr)
 
         # Primal update: EMA centroid step.
@@ -1302,10 +1300,11 @@ class MoECentroidRouter(MoERouter):
             one_minus_alpha = self.centroid_lr_lambda * lr
         else:
             one_minus_alpha = 1.0 - self.centroid_alpha
-        assert 0.0 < one_minus_alpha <= 1.0, (
-            f"centroid step size must be in (0, 1]; got {one_minus_alpha:.6f} "
-            f"(centroid_lr_lambda={self.centroid_lr_lambda}, lr={lr})"
-        )
+        if not (0.0 < one_minus_alpha <= 1.0):
+            raise OLMoConfigurationError(
+                f"centroid step size must be in (0, 1]; got {one_minus_alpha:.6f} "
+                f"(centroid_lr_lambda={self.centroid_lr_lambda}, lr={lr})"
+            )
 
         centroid = cast(torch.Tensor, self._centroid)
         centroid_step = cast(torch.Tensor, self._centroid_step)
@@ -1317,12 +1316,13 @@ class MoECentroidRouter(MoERouter):
             dist.all_reduce(count_accum, group=self.group)
 
         has_tokens = count_accum > 0
-        if has_tokens.any() and not dry_run:
-            obs_mean = sum_accum[has_tokens] / count_accum[has_tokens].unsqueeze(-1)
-            # Boolean indexing returns a copy; lerp_ on it would be a no-op.
-            # Use out-of-place lerp and assign back to update the buffer in-place.
-            # Only active experts update; cold centroids stay put (no decay toward zero).
-            centroid[has_tokens] = centroid[has_tokens].lerp(obs_mean, one_minus_alpha)
+        if not dry_run:
+            if has_tokens.any():
+                obs_mean = sum_accum[has_tokens] / count_accum[has_tokens].unsqueeze(-1)
+                # Boolean indexing returns a copy; lerp_ on it would be a no-op.
+                # Use out-of-place lerp and assign back to update the buffer in-place.
+                # Only active experts update; cold centroids stay put (no decay toward zero).
+                centroid[has_tokens] = centroid[has_tokens].lerp(obs_mean, one_minus_alpha)
             centroid_step.add_(1)
             self._centroid_step_py += 1
 
@@ -1338,7 +1338,6 @@ class MoECentroidRouter(MoERouter):
         expert_weights, expert_indices, batch_size_per_expert, aux_loss = super().forward(
             x, loss_div_factor=loss_div_factor
         )
-        # Accumulate hidden states per assigned expert for the primal centroid update.
         if self.training and torch.is_grad_enabled():
             with torch.no_grad():
                 flat_h = x.view(-1, self.d_model).float()
@@ -1347,8 +1346,6 @@ class MoECentroidRouter(MoERouter):
 
     def reset_metrics(self):
         super().reset_metrics()
-        self._centroid_sum_accum = None
-        self._centroid_count_accum = None
 
     @torch.no_grad()
     def compute_metrics(

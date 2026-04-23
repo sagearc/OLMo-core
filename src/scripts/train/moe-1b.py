@@ -238,8 +238,8 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         # Scores: cos(h, c_k) + b_k, top-k selection, identity weights (no softmax).
         # No auxiliary losses, no router weight parameters, no static hyperparameters.
         moe.router.name = MoERouterType.centroid
-        moe.router.centroid_lr_lambda = 1.0
-        moe.router.bias_lr_lambda = 2.0
+        moe.router.centroid_lr_lambda = 10.0
+        moe.router.bias_lr_lambda = 1.0
         moe.router.gating_function = MoERouterGatingFunction.identity
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
