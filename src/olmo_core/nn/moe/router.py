@@ -260,13 +260,12 @@ class MoERouterConfig(ModuleConfig):
             lb_loss_granularity=lb_loss_granularity,
             z_loss_weight=z_loss_weight,
         )
-        if self.dtype is not None:
-            kwargs["dtype"] = self.dtype.as_pt()
-        elif dtype is not None:
-            kwargs["dtype"] = dtype
-
         try:
             if self.name == MoERouterType.default:
+                if self.dtype is not None:
+                    kwargs["dtype"] = self.dtype.as_pt()
+                elif dtype is not None:
+                    kwargs["dtype"] = dtype
                 return MoELinearRouter(**kwargs)
             elif self.name == MoERouterType.centroid:
                 return MoECentroidRouter(**kwargs)

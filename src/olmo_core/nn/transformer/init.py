@@ -189,7 +189,7 @@ class InitMethod(StrEnum):
         std: float = 0.02,
         generator: Optional[torch.Generator] = None,
     ):
-        from ..moe import DroplessMoEMLP, MoELinearRouter, MoEMLP
+        from ..moe import DroplessMoEMLP, MoECentroidRouter, MoELinearRouter, MoEMLP
 
         if self == InitMethod.llama:
             std = std / (2 * num_blocks) ** 0.5
@@ -199,15 +199,16 @@ class InitMethod(StrEnum):
             # For fan_in, router weight uses 1/√d_model
             std = d_model**-0.5
 
-        _apply_init(
-            nn.init.trunc_normal_,
-            cast(MoELinearRouter, m.router).weight,
-            mean=0.0,
-            std=std,
-            a=-3 * std,
-            b=3 * std,
-            generator=generator,
-        )
+        if not isinstance(m.router, MoECentroidRouter):
+            _apply_init(
+                nn.init.trunc_normal_,
+                cast(MoELinearRouter, m.router).weight,
+                mean=0.0,
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+                generator=generator,
+            )
 
         mlp = cast(Union[MoEMLP, DroplessMoEMLP], m.experts.mlp)
 
