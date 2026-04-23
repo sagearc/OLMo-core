@@ -404,7 +404,7 @@ class TransformerPipelineTrainModule(TrainModule):
             **model_kwargs,
         )
 
-        current_lr = self.optimizers[0].param_groups[0]["lr"]
+        current_lr = float(self.optimizers[0].param_groups[0]["lr"])
         for model in self.model_parts:
             model.post_batch(dry_run=dry_run, lr=current_lr)
 

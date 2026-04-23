@@ -361,7 +361,7 @@ class MoERouter(nn.Module):
         self.cp_mesh: Optional[dist.DeviceMesh] = None
         self.tp_mesh: Optional[dist.DeviceMesh] = None
 
-        if self.bias_gamma is not None or self.bias_lr_lambda is not None:
+        if self._bias_enabled:
             if self.bias_gamma is not None:
                 assert self.bias_gamma > 0
             self.register_buffer("score_bias", torch.zeros(self.num_experts, device=init_device))
@@ -448,12 +448,16 @@ class MoERouter(nn.Module):
         if self.ema_zscore_normalize and self._ema_step_count is not None:
             self._ema_step_py = int(cast(torch.Tensor, self._ema_step_count).item())
 
+    @property
+    def _bias_enabled(self) -> bool:
+        return self.bias_gamma is not None or self.bias_lr_lambda is not None
+
     def reset_parameters(self):
         self._batch_size_per_expert = hide_from_torch(
             torch.zeros(self.num_experts, device=self.device)
         )
 
-        if self.bias_gamma is not None or self.bias_lr_lambda is not None:
+        if self._bias_enabled:
             assert self.score_bias is not None
             score_bias = cast(torch.Tensor, self.score_bias)
             score_bias.zero_()
@@ -490,7 +494,7 @@ class MoERouter(nn.Module):
 
     @property
     def score_bias_batch_size_per_expert(self) -> Optional[torch.Tensor]:
-        if self.bias_gamma is not None or self.bias_lr_lambda is not None:
+        if self._bias_enabled:
             if self._score_bias_batch_size_per_expert is None:
                 self._score_bias_batch_size_per_expert = hide_from_torch(
                     torch.zeros(self.num_experts, device=self.device)
@@ -568,7 +572,6 @@ class MoERouter(nn.Module):
             return
 
         # ---- DeepSeek bias-rule update --------------------------------------------------
-        effective_gamma: Optional[float]
         if self.bias_lr_lambda is not None and lr is not None:
             effective_gamma = self.bias_lr_lambda * lr
         else:
@@ -829,7 +832,7 @@ class MoERouter(nn.Module):
     def get_top_k(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         expert_weights: torch.Tensor
         expert_indices: torch.Tensor
-        if self.bias_gamma is None and self.bias_lr_lambda is None:
+        if not self._bias_enabled:
             if self.top_k == 1:
                 expert_weights, expert_indices = scores.max(dim=-1, keepdim=True)
             else:
@@ -1054,7 +1057,7 @@ class MoERouter(nn.Module):
                     aux_loss = scaled_seq_aux if aux_loss is None else aux_loss + scaled_seq_aux
 
             self.batch_size_per_expert += batch_size_per_expert
-            if self.bias_gamma is not None or self.bias_lr_lambda is not None:
+            if self._bias_enabled:
                 assert self.score_bias_batch_size_per_expert is not None
                 self.score_bias_batch_size_per_expert += batch_size_per_expert
 
@@ -1217,6 +1220,10 @@ class MoECentroidRouter(MoERouter):
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
         if self._centroid_step is not None:
             self._centroid_step_py = int(cast(torch.Tensor, self._centroid_step).item())
+        # Discard any in-flight microbatch accumulations — they belong to the
+        # pre-checkpoint forward pass and are invalid after a state-dict load.
+        self._centroid_sum_accum = None
+        self._centroid_count_accum = None
 
     def reset_parameters(self):
         super().reset_parameters()
@@ -1293,9 +1300,13 @@ class MoECentroidRouter(MoERouter):
             return
 
         if self.centroid_lr_lambda is not None and lr is not None:
-            alpha = 1.0 - self.centroid_lr_lambda * lr
+            one_minus_alpha = self.centroid_lr_lambda * lr
         else:
-            alpha = self.centroid_alpha
+            one_minus_alpha = 1.0 - self.centroid_alpha
+        assert 0.0 < one_minus_alpha <= 1.0, (
+            f"centroid step size must be in (0, 1]; got {one_minus_alpha:.6f} "
+            f"(centroid_lr_lambda={self.centroid_lr_lambda}, lr={lr})"
+        )
 
         centroid = cast(torch.Tensor, self._centroid)
         centroid_step = cast(torch.Tensor, self._centroid_step)
@@ -1309,9 +1320,10 @@ class MoECentroidRouter(MoERouter):
         has_tokens = count_accum > 0
         if has_tokens.any() and not dry_run:
             obs_mean = sum_accum[has_tokens] / count_accum[has_tokens].unsqueeze(-1)
-            # Only update centroids that received tokens this step; cold centroids
-            # keep their current value intact (no spurious decay toward zero).
-            centroid[has_tokens].lerp_(obs_mean, 1.0 - alpha)
+            # Boolean indexing returns a copy; lerp_ on it would be a no-op.
+            # Use out-of-place lerp and assign back to update the buffer in-place.
+            # Only active experts update; cold centroids stay put (no decay toward zero).
+            centroid[has_tokens] = centroid[has_tokens].lerp(obs_mean, one_minus_alpha)
             centroid_step.add_(1)
             self._centroid_step_py += 1
 
@@ -1349,8 +1361,14 @@ class MoECentroidRouter(MoERouter):
         step = self._centroid_step_py
         if step > 0:
             centroid = cast(torch.Tensor, self._centroid)
-            bc = 1.0 - self.centroid_alpha**step
-            centroid_hat = centroid / bc
+            if self.centroid_lr_lambda is None:
+                # Static alpha: bias correction 1/(1-α^t) is exact.
+                bc = 1.0 - self.centroid_alpha**step
+                centroid_hat = centroid / bc
+            else:
+                # Variable alpha (LR-coupled): per-step alphas differ, so 1/(1-α^t) is
+                # invalid. Log the raw buffer norm — still useful for diagnosing collapse.
+                centroid_hat = centroid
             norms = centroid_hat.norm(dim=-1)
             for i in range(norms.shape[0]):
                 out[f"expert {i:02d}/centroid norm"] = (norms[i], ReduceType.mean)
