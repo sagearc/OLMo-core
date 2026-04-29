@@ -33,6 +33,12 @@ Usage:
         ema_centroid      gradient-free EMA centroid routing + dual bias — primal-dual
                           algorithm for capacity-constrained clustering; no router params,
                           no aux losses, zero inter-centroid gradient coupling
+        ema_centroid_sph  as `ema_centroid` but with spherical k-means M-step: observed
+                          cluster mean is L2-normalised before the lerp, keeping centroids
+                          on the unit sphere — consistent with the cosine similarity score
+        ema_centroid_sph_c2  as `ema_centroid_sph` but with 2 sub-centroids per expert
+                          (128 total); expert score = max cosine sim over its 2 sub-centroids,
+                          M-step updates the winning sub-centroid (winner-takes-all)
 """
 
 import sys
@@ -51,7 +57,7 @@ from olmo_core.data.numpy_dataset import NumpyDatasetConfig
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.nn.moe import MoEConfig, MoERouterGatingFunction, MoERouterType
 from olmo_core.nn.transformer import TransformerBlockConfig, TransformerConfig
-from olmo_core.optim import AdamWConfig, CosWithWarmup, OptimGroupOverride
+from olmo_core.optim import CosWithWarmup, OptimGroupOverride, SkipStepAdamWConfig
 from olmo_core.train import (
     Duration,
     TrainerConfig,
@@ -128,6 +134,11 @@ class RoutingVariant(StrEnum):
     ema_trend_damped = "ema_trend_damped"
     ema_trend_bias = "ema_trend_bias"
     ema_centroid = "ema_centroid"
+    ema_centroid_randinit = "ema_centroid_randinit"
+    ema_centroid_sph = "ema_centroid_sph"
+    ema_centroid_sph_c2 = "ema_centroid_sph_c2"
+    baseline_no_loss = "baseline_no_loss"
+    deepseek_v3 = "deepseek_v3"
 
 
 def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
@@ -151,6 +162,20 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.router.gating_function = MoERouterGatingFunction.sigmoid
         moe.router.bias_gamma = 1e-3
         moe.router.normalize_expert_weights = 1.0
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.deepseek_v3:
+        # Full DeepSeek-V3 recipe (arXiv:2412.19437 §2.1): everything in `deepseek`
+        # plus the complementary sequence-wise auxiliary loss (§2.1.2, α=1e-4).
+        # That loss penalises within-sequence token concentration independently of
+        # the bias rule, which handles cross-batch imbalance. Together they are the
+        # complete published V3 load-balancing stack.
+        moe.router.gating_function = MoERouterGatingFunction.sigmoid
+        moe.router.bias_gamma = 1e-3
+        moe.router.normalize_expert_weights = 1.0
+        moe.router.seq_aux_loss_weight = 1e-4
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
@@ -223,7 +248,7 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.z_loss_weight = None
         return
 
-    if variant == RoutingVariant.ema_centroid:
+    if variant in (RoutingVariant.ema_centroid, RoutingVariant.ema_centroid_randinit):
         # Primal-dual algorithm for capacity-constrained online clustering (paper §3).
         #
         # Primal (M-step): c_k ← α_t·c_k + (1-α_t)·mean_{assigned}(h)
@@ -237,10 +262,47 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         #
         # Scores: cos(h, c_k) + b_k, top-k selection, identity weights (no softmax).
         # No auxiliary losses, no router weight parameters, no static hyperparameters.
+        # (ema_centroid_randinit is a legacy alias — init is always random unit vectors.)
         moe.router.name = MoERouterType.centroid
         moe.router.centroid_lr_lambda = 10.0
         moe.router.bias_lr_lambda = 1.0
         moe.router.gating_function = MoERouterGatingFunction.identity
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_centroid_sph:
+        # Same primal-dual algorithm as `ema_centroid` but with the spherical k-means
+        # M-step: the observed cluster mean is L2-normalised before the lerp, keeping
+        # centroids on the unit sphere and making the update consistent with the cosine
+        # similarity routing criterion. Ablates whether the standard k-means M-step
+        # (raw mean) vs. spherical M-step (normalised mean) matters empirically.
+        moe.router.name = MoERouterType.centroid
+        moe.router.centroid_lr_lambda = 10.0
+        moe.router.bias_lr_lambda = 1.0
+        moe.router.centroid_spherical = True
+        moe.router.gating_function = MoERouterGatingFunction.identity
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_centroid_sph_c2:
+        # As `ema_centroid_sph` but each expert has C=2 sub-centroids (128 total vectors).
+        # Expert score = max cosine sim over its 2 sub-centroids; M-step updates only the
+        # winning sub-centroid (winner-takes-all). Lets each expert cover two distinct modes.
+        moe.router.name = MoERouterType.centroid
+        moe.router.centroid_lr_lambda = 10.0
+        moe.router.bias_lr_lambda = 1.0
+        moe.router.centroid_spherical = True
+        moe.router.num_centroids_per_expert = 2
+        moe.router.gating_function = MoERouterGatingFunction.identity
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.baseline_no_loss:
+        # Softmax top-k with no auxiliary losses — pure routing signal, no lb_loss,
+        # no z_loss. Floor for what load imbalance looks like without any constraint.
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
@@ -315,14 +377,13 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
     train_module_config = TransformerTrainModuleConfig(
         rank_microbatch_size=96 * SEQUENCE_LENGTH,
         max_sequence_length=SEQUENCE_LENGTH,
-        optim=AdamWConfig(
+        optim=SkipStepAdamWConfig(
             lr=1e-3,
             weight_decay=0.1,
             betas=(0.9, 0.95),
             group_overrides=[
                 OptimGroupOverride(params=["embeddings.weight"], opts=dict(weight_decay=0.0))
             ],
-            fused=True,
         ),
         compile_model=True,
         dp_config=TransformerDataParallelConfig(

@@ -86,6 +86,7 @@ class WandBCallback(Callback):
 
     _wandb = None
     _run_path = None
+    _run_id: Optional[str] = None
     _finalized: bool = False
 
     @property
@@ -117,6 +118,12 @@ class WandBCallback(Callback):
             self.wandb.finish(exit_code=exit_code, quiet=True)
             self._finalized = True
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {"run_id": self._run_id}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        self._run_id = state_dict.get("run_id")
+
     def pre_train(self):
         if self.enabled and get_rank() == 0:
             if WANDB_API_KEY_ENV_VAR not in os.environ:
@@ -134,8 +141,11 @@ class WandBCallback(Callback):
                 tags=self.tags,
                 notes=self.notes,
                 config=self.config,
+                id=self._run_id,
+                resume="must" if self._run_id is not None else None,
             )
             self._run_path = self.run.path  # type: ignore
+            self._run_id = self.run.id  # type: ignore
 
     def log_metrics(self, step: int, metrics: Dict[str, float]):
         if self.enabled and get_rank() == 0:

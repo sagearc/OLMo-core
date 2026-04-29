@@ -136,6 +136,24 @@ class MoERouterConfig(ModuleConfig):
     so the dual ascent step size also decays with the LR schedule.
     ``bias_gamma`` is ignored when this is set.
     """
+    centroid_spherical: bool = False
+    """
+    When ``True``, the centroid EMA update normalizes the observed cluster mean to a
+    unit vector before the lerp step, making the primal M-step consistent with the
+    cosine similarity routing criterion (spherical k-means M-step).  Default ``False``
+    preserves the standard k-means M-step (raw hidden-state mean), which can cause
+    centroid norms to drift away from the unit sphere.  Only used when
+    ``name == MoERouterType.centroid``.
+    """
+    num_centroids_per_expert: int = 1
+    """
+    Number of sub-centroids per expert.  With ``C > 1``, each expert maintains ``C``
+    centroid vectors.  The routing score for expert ``k`` is the maximum cosine
+    similarity across its ``C`` sub-centroids, and the M-step updates only the
+    winning sub-centroid (winner-takes-all within each expert).  This allows a single
+    expert to cover multiple modes in its token distribution.  Only used when
+    ``name == MoERouterType.centroid``.
+    """
     seq_aux_loss_weight: Optional[float] = None
     """
     If set, enables the DeepSeek-v3 complementary sequence-wise auxiliary loss
@@ -262,6 +280,10 @@ class MoERouterConfig(ModuleConfig):
         )
         try:
             if self.name == MoERouterType.default:
+                kwargs.pop("centroid_alpha", None)
+                kwargs.pop("centroid_lr_lambda", None)
+                kwargs.pop("centroid_spherical", None)
+                kwargs.pop("num_centroids_per_expert", None)
                 if self.dtype is not None:
                     kwargs["dtype"] = self.dtype.as_pt()
                 elif dtype is not None:
@@ -1187,22 +1209,30 @@ class MoECentroidRouter(MoERouter):
         *,
         centroid_alpha: float = 0.99,
         centroid_lr_lambda: Optional[float] = None,
+        centroid_spherical: bool = False,
+        num_centroids_per_expert: int = 1,
         init_device: str = "cpu",
         **kwargs,
     ):
         assert 0.0 < centroid_alpha < 1.0, (
             f"centroid_alpha must be in (0, 1), got {centroid_alpha}."
         )
+        assert num_centroids_per_expert >= 1, (
+            f"num_centroids_per_expert must be >= 1, got {num_centroids_per_expert}."
+        )
         super().__init__(init_device=init_device, **kwargs)
         self.centroid_alpha = centroid_alpha
         self.centroid_lr_lambda = centroid_lr_lambda
+        self.centroid_spherical = centroid_spherical
+        self.num_centroids_per_expert = num_centroids_per_expert
 
-        # Centroids: shape (num_experts, d_model).  Zero-init; bias correction
-        # ``1/(1-α^t)`` yields meaningful cosine similarities from step 1.
-        self.register_buffer(
-            "_centroid",
-            torch.zeros(self.num_experts, self.d_model, dtype=torch.float32, device=init_device),
+        # Random unit vectors — shape (K*C, d_model).
+        centroid_init = torch.randn(
+            self.num_experts * num_centroids_per_expert, self.d_model,
+            dtype=torch.float32, device=init_device,
         )
+        F.normalize(centroid_init, dim=-1, out=centroid_init)
+        self.register_buffer("_centroid", centroid_init)
         self.register_buffer(
             "_centroid_step",
             torch.zeros((), dtype=torch.long, device=init_device),
@@ -1227,7 +1257,9 @@ class MoECentroidRouter(MoERouter):
     def reset_parameters(self):
         super().reset_parameters()
         if self._centroid is not None:
-            cast(torch.Tensor, self._centroid).zero_()
+            centroid = cast(torch.Tensor, self._centroid)
+            nn.init.normal_(centroid)
+            F.normalize(centroid, dim=-1, out=centroid)
         if self._centroid_step is not None:
             cast(torch.Tensor, self._centroid_step).zero_()
         self._centroid_step_py = 0
@@ -1241,44 +1273,58 @@ class MoECentroidRouter(MoERouter):
 
     def get_expert_logits(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Cosine similarity between each token and each bias-corrected centroid.
+        Cosine similarity between each token and each centroid.
 
-        At step 0 (no observations yet) returns zeros so all experts are equally
-        likely and the first batch seeds the centroids without any NaN from
-        dividing a zero centroid.
+        Centroids are random unit vectors from init, so all experts are immediately
+        valid. Bias-correction (1/(1-α^t)) cancels in cosine similarity, so we
+        normalise the EMA buffer directly rather than applying the correction.
 
         :returns: Cosine similarities of shape ``(*, num_experts)`` in ``[-1, 1]``.
         """
-        step = self._centroid_step_py
-        if step == 0:
-            shape = x.shape[:-1] + (self.num_experts,)
-            return torch.zeros(shape, dtype=torch.float32, device=x.device)
-
         centroid = cast(torch.Tensor, self._centroid)
         flat = x.float().view(-1, self.d_model)
         # F.normalize handles zero-norm rows gracefully (returns zeros).
         # Bias-correction (1/(1-α^t)) cancels in cosine similarity, so normalise directly.
         h_norm = F.normalize(flat, dim=-1)
         c_norm = F.normalize(centroid, dim=-1)
-        cos_sim = h_norm @ c_norm.t()
+        cos_sim = h_norm @ c_norm.t()  # (N, K*C)
+        if self.num_centroids_per_expert > 1:
+            # Score for expert k = max cosine sim over its C sub-centroids.
+            cos_sim = cos_sim.view(-1, self.num_experts, self.num_centroids_per_expert).amax(dim=-1)
         return cos_sim.view(*x.shape[:-1], self.num_experts)
 
     @torch.no_grad()
     def _accumulate_centroid(self, flat_h: torch.Tensor, expert_indices: torch.Tensor) -> None:
         """
-        :param flat_h: Raw hidden states, shape ``(N, d_model)``, float32.
-        :param expert_indices: Assignment indices, shape ``(N, top_k)``.
+        :param flat_h: Hidden states, shape ``(N, d_model)``, float32.
+                       Unit-norm when ``centroid_spherical=True``, raw otherwise.
+        :param expert_indices: Expert assignment indices, shape ``(N, top_k)``, in ``[0, K)``.
         """
         N, d = flat_h.shape
         K = self.num_experts
+        C = self.num_centroids_per_expert
         # Repeat each token's hidden state for each of its top_k assignments.
         h_rep = flat_h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(N * self.top_k, d)
-        idx = expert_indices.reshape(-1).long()
+        expert_idx = expert_indices.reshape(-1).long()  # (N*top_k,) in [0, K)
 
-        centroid_sum = torch.zeros(K, d, dtype=torch.float32, device=flat_h.device)
-        centroid_count = torch.zeros(K, dtype=torch.float32, device=flat_h.device)
-        centroid_sum.index_add_(0, idx, h_rep)
-        centroid_count.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+        if C == 1:
+            global_idx = expert_idx
+        else:
+            # Winner-takes-all within each expert: find the sub-centroid with highest
+            # cosine similarity to the token and accumulate only to that one.
+            centroid = cast(torch.Tensor, self._centroid)  # (K*C, d)
+            assigned_c = centroid.reshape(K, C, d)[expert_idx]  # (N*top_k, C, d)
+            # h_rep is already unit-norm when centroid_spherical=True; normalize otherwise.
+            h_unit = (h_rep if self.centroid_spherical else F.normalize(h_rep, dim=-1)).unsqueeze(1)
+            F.normalize(assigned_c, dim=-1, out=assigned_c)
+            sims = (h_unit * assigned_c).sum(-1)  # (N*top_k, C)
+            winning_sub = sims.argmax(dim=-1)  # (N*top_k,) in [0, C)
+            global_idx = expert_idx * C + winning_sub  # (N*top_k,) in [0, K*C)
+
+        centroid_sum = torch.zeros(K * C, d, dtype=torch.float32, device=flat_h.device)
+        centroid_count = torch.zeros(K * C, dtype=torch.float32, device=flat_h.device)
+        centroid_sum.index_add_(0, global_idx, h_rep)
+        centroid_count.index_add_(0, global_idx, torch.ones_like(global_idx, dtype=torch.float32))
 
         if self._centroid_sum_accum is None:
             self._centroid_sum_accum = hide_from_torch(centroid_sum)
@@ -1319,10 +1365,18 @@ class MoECentroidRouter(MoERouter):
         if not dry_run:
             if has_tokens.any():
                 obs_mean = sum_accum[has_tokens] / count_accum[has_tokens].unsqueeze(-1)
+                if self.centroid_spherical:
+                    obs_mean = F.normalize(obs_mean, dim=-1)
                 # Boolean indexing returns a copy; lerp_ on it would be a no-op.
                 # Use out-of-place lerp and assign back to update the buffer in-place.
                 # Only active experts update; cold centroids stay put (no decay toward zero).
-                centroid[has_tokens] = centroid[has_tokens].lerp(obs_mean, one_minus_alpha)
+                updated = centroid[has_tokens].lerp(obs_mean, one_minus_alpha)
+                if self.centroid_spherical:
+                    # Renormalize to keep buffer on the unit sphere (canonical spherical k-means).
+                    # get_expert_logits normalizes at query time anyway, but keeping the buffer
+                    # unit-norm makes centroid-norm metrics interpretable.
+                    updated = F.normalize(updated, dim=-1)
+                centroid[has_tokens] = updated
             centroid_step.add_(1)
             self._centroid_step_py += 1
 
@@ -1341,6 +1395,8 @@ class MoECentroidRouter(MoERouter):
         if self.training and torch.is_grad_enabled():
             with torch.no_grad():
                 flat_h = x.view(-1, self.d_model).float()
+                if self.centroid_spherical:
+                    flat_h = F.normalize(flat_h, dim=-1)
                 self._accumulate_centroid(flat_h, expert_indices.view(-1, self.top_k))
         return expert_weights, expert_indices, batch_size_per_expert, aux_loss
 
@@ -1366,8 +1422,14 @@ class MoECentroidRouter(MoERouter):
                 # invalid. Log the raw buffer norm — still useful for diagnosing collapse.
                 centroid_hat = centroid
             norms = centroid_hat.norm(dim=-1)
+            C = self.num_centroids_per_expert
             for i in range(norms.shape[0]):
-                out[f"expert {i:02d}/centroid norm"] = (norms[i], ReduceType.mean)
+                key = (
+                    f"expert {i // C:02d}/sub {i % C}/centroid norm"
+                    if C > 1
+                    else f"expert {i:02d}/centroid norm"
+                )
+                out[key] = (norms[i], ReduceType.mean)
         out["centroid step"] = (
             cast(torch.Tensor, self._centroid_step).float(),
             ReduceType.mean,
