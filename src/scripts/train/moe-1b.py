@@ -41,8 +41,10 @@ Usage:
                           M-step updates the winning sub-centroid (winner-takes-all)
 """
 
+import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, cast
 
 from olmo_core.config import Config, DType, StrEnum
@@ -83,9 +85,13 @@ SEQUENCE_LENGTH = 2048
 GLOBAL_BATCH_SIZE = 1152 * SEQUENCE_LENGTH
 MAX_TOKENS = 100_000_000_000
 
-DATASET_DIR = "/home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized"
-EVAL_BASE_DIR = "/home/morg/students/sagiahrac/dataset/olmoe-1pct"
-REPO_DIR = "/home/morg/students/sagiahrac/repos/olmo-core-repo"
+REPO_DIR = os.environ.get("OLMO_CORE_REPO_DIR", str(Path(__file__).resolve().parents[3]))
+DATA_ROOT = os.environ.get("OLMO_DATA_ROOT", "dataset/olmoe-1pct")
+DATASET_DIR = os.environ.get("OLMO_DATASET_DIR", f"{DATA_ROOT}/tokenized")
+EVAL_BASE_DIR = os.environ.get("OLMO_EVAL_BASE_DIR", DATA_ROOT)
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY") or None
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "MoE")
+WANDB_ENABLED = os.environ.get("WANDB_DISABLED", "0") != "1"
 
 DATA_PATHS = [
     f"{DATASET_DIR}/algebraic-stack/part-0-00000.npy",
@@ -135,6 +141,8 @@ class RoutingVariant(StrEnum):
     ema_trend_bias = "ema_trend_bias"
     ema_centroid = "ema_centroid"
     ema_centroid_randinit = "ema_centroid_randinit"
+    ema_centroid_deepseek = "ema_centroid_deepseek"
+    ema_centroid_deepseek_c2 = "ema_centroid_deepseek_c2"
     ema_centroid_sph = "ema_centroid_sph"
     ema_centroid_sph_c2 = "ema_centroid_sph_c2"
     baseline_no_loss = "baseline_no_loss"
@@ -267,6 +275,54 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.router.centroid_lr_lambda = 10.0
         moe.router.bias_lr_lambda = 1.0
         moe.router.gating_function = MoERouterGatingFunction.identity
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_centroid_deepseek:
+        # DeepSeek-style gating (arXiv:2408.15664 §4) on top of the centroid algorithm.
+        #
+        # Routing logits are the raw dot product `h · c_k`, with centroids constrained
+        # to the unit sphere (`centroid_spherical=True`) — the analog of weight decay
+        # on a learned linear router, so logits stay in std ~1 (instead of std ~34)
+        # and sigmoid gives genuine soft weights (instead of saturating to 0/1).
+        #
+        # Gating + L1 match arXiv:2408.15664 §4:
+        #   sigmoid(h · c_k) → bias-shifted top-k → L1 renorm.
+        # Bias rule uses constant `bias_gamma=1e-3` (deepseek-style) instead of the
+        # LR-tied `bias_lr_lambda` — matches deepseek's load-balancing rate exactly,
+        # avoiding the ~10× slower bias accumulation during LR warmup.
+        #
+        # No seq-aux loss (DeepSeek-V3's complementary loss is redundant with the
+        # primal-dual bias rule, and would fight the centroid algorithm's natural
+        # within-sequence content clustering).
+        #
+        # M-step is the spherical k-means update (L2-normalised mean before lerp), to
+        # keep centroids on the unit sphere and consistent with the routing geometry.
+        moe.router.name = MoERouterType.centroid
+        moe.router.centroid_lr_lambda = 10.0
+        moe.router.bias_gamma = 1e-3
+        moe.router.centroid_spherical = True
+        moe.router.gating_function = MoERouterGatingFunction.sigmoid
+        moe.router.normalize_expert_weights = 1.0
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_centroid_deepseek_c2:
+        # As `ema_centroid_deepseek` but each expert has C=2 sub-centroids (128 unit
+        # vectors total). Expert k's routing logit = max over its 2 sub-centroids of
+        # `h · c_{k,c}`; M-step updates only the winning sub-centroid (winner-takes-all,
+        # picked by cosine similarity in `_accumulate_centroid`). Lets each expert
+        # cover two distinct directional modes while keeping the deepseek-style soft
+        # sigmoid + L1 gating.
+        moe.router.name = MoERouterType.centroid
+        moe.router.centroid_lr_lambda = 10.0
+        moe.router.bias_gamma = 1e-3
+        moe.router.centroid_spherical = True
+        moe.router.num_centroids_per_expert = 2
+        moe.router.gating_function = MoERouterGatingFunction.sigmoid
+        moe.router.normalize_expert_weights = 1.0
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
@@ -422,10 +478,10 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
             "wandb",
             WandBCallback(
                 name=wandb_name,
-                entity="sagiah",
-                project="MoE",
+                entity=WANDB_ENTITY,
+                project=WANDB_PROJECT,
                 group=routing.value,
-                enabled=True,
+                enabled=WANDB_ENABLED,
                 cancel_check_interval=10,
             ),
         )

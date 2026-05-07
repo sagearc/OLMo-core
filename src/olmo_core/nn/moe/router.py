@@ -1173,9 +1173,11 @@ class MoECentroidRouter(MoERouter):
     capacity-constrained online clustering (see paper §3).
 
     Each expert ``k`` maintains a centroid ``c_k ∈ R^{d_model}`` that tracks the
-    running mean of hidden states routed to it.  Routing scores are cosine
-    similarities between the current token representation and the bias-corrected
-    centroids.  No gradient ever flows into ``c_k`` — it is a pure statistic.
+    running mean of hidden states routed to it.  Routing logits are the raw dot
+    product ``h · c_k``; the gating function (softmax / sigmoid / identity) and
+    ``normalize_expert_weights`` are orthogonal config choices that determine how
+    those logits become per-token expert weights.  No gradient ever flows into
+    ``c_k`` — it is a pure statistic.
 
     **Primal update** (centroid tracking, M-step):
 
@@ -1197,7 +1199,7 @@ class MoECentroidRouter(MoERouter):
 
     .. math::
 
-        \\max_{Z,C} \\mathbb{E}_x\\bigl[\\sum_k z_k(x)\\cos(h(x), c_k)\\bigr]
+        \\max_{Z,C} \\mathbb{E}_x\\bigl[\\sum_k z_k(x)\\,\\langle h(x), c_k\\rangle\\bigr]
         \\quad \\text{s.t.} \\quad \\mathbb{E}_x[z_k(x)] = \\tau \\;\\forall k
 
     without any auxiliary loss term and without any inter-centroid gradient
@@ -1273,25 +1275,24 @@ class MoECentroidRouter(MoERouter):
 
     def get_expert_logits(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Cosine similarity between each token and each centroid.
+        Raw dot product between each token and each centroid.
 
         Centroids are random unit vectors from init, so all experts are immediately
-        valid. Bias-correction (1/(1-α^t)) cancels in cosine similarity, so we
-        normalise the EMA buffer directly rather than applying the correction.
+        valid. Score magnitudes scale with ``‖h‖ · ‖c_k‖``, so depending on the
+        chosen ``gating_function`` (softmax over all experts, sigmoid, or identity)
+        and on whether ``normalize_expert_weights`` is set, downstream gating may
+        saturate or peak sharply — these are orthogonal config choices the caller
+        controls.
 
-        :returns: Cosine similarities of shape ``(*, num_experts)`` in ``[-1, 1]``.
+        :returns: Dot products of shape ``(*, num_experts)``.
         """
         centroid = cast(torch.Tensor, self._centroid)
         flat = x.float().view(-1, self.d_model)
-        # F.normalize handles zero-norm rows gracefully (returns zeros).
-        # Bias-correction (1/(1-α^t)) cancels in cosine similarity, so normalise directly.
-        h_norm = F.normalize(flat, dim=-1)
-        c_norm = F.normalize(centroid, dim=-1)
-        cos_sim = h_norm @ c_norm.t()  # (N, K*C)
+        score = flat @ centroid.t()  # (N, K*C)
         if self.num_centroids_per_expert > 1:
-            # Score for expert k = max cosine sim over its C sub-centroids.
-            cos_sim = cos_sim.view(-1, self.num_experts, self.num_centroids_per_expert).amax(dim=-1)
-        return cos_sim.view(*x.shape[:-1], self.num_experts)
+            # Score for expert k = max raw dot over its C sub-centroids.
+            score = score.view(-1, self.num_experts, self.num_centroids_per_expert).amax(dim=-1)
+        return score.view(*x.shape[:-1], self.num_experts)
 
     @torch.no_grad()
     def _accumulate_centroid(self, flat_h: torch.Tensor, expert_indices: torch.Tensor) -> None:

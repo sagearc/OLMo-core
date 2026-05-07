@@ -1,10 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=moe-1b
-#SBATCH --output=/home/morg/students/sagiahrac/repos/olmo-core-repo/slurm_output/moe-1b-%x-%j.out
-#SBATCH --error=/home/morg/students/sagiahrac/repos/olmo-core-repo/slurm_output/moe-1b-%x-%j.err
-#SBATCH --partition=gpu-morgeva
-#SBATCH --account=gpu-research
-#SBATCH --nodelist=n-210
+#SBATCH --output=slurm_output/moe-1b-%x-%j.out
+#SBATCH --error=slurm_output/moe-1b-%x-%j.err
+#SBATCH --partition=gpu
+#SBATCH --account=research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:amd:1
@@ -24,10 +23,15 @@ if [ -z "$WANDB_API_KEY" ]; then
     exit 1
 fi
 
+# If RUN_NAME is not set, generate one from the job ID (new run).
+# To resume an existing run, pass RUN_NAME=moe-1b-<original-job-id>.
+RUN_NAME=${RUN_NAME:-moe-1b-${SLURM_JOB_ID}}
+
 export ROCM_HOME=/opt/rocm-6.4.3
 export OLMO_CORE_USE_TORCH_GROUPED_MM=1
 
-cd /home/morg/students/sagiahrac/repos/olmo-core-repo
+REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "$REPO_DIR"
 
 source .venv/bin/activate
 
@@ -35,5 +39,6 @@ torchrun \
     --standalone \
     --nproc_per_node=1 \
     src/scripts/train/moe-1b.py \
-    moe-1b-${SLURM_JOB_ID} \
-    --routing=${ROUTING}
+    ${RUN_NAME} \
+    --routing=${ROUTING} \
+    ${OVERRIDES:-}

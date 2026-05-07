@@ -1,10 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=olmoe-1.2b-baseline-shared-1gpu-rocm
-#SBATCH --output=/home/morg/students/sagiahrac/repos/olmo-core-repo/slurm_output/olmoe-1.2b-baseline-shared-1gpu-rocm-%j.out
-#SBATCH --error=/home/morg/students/sagiahrac/repos/olmo-core-repo/slurm_output/olmoe-1.2b-baseline-shared-1gpu-rocm-%j.err
-#SBATCH --partition=gpu-morgeva
-#SBATCH --account=gpu-research
-#SBATCH --nodelist=n-210
+#SBATCH --output=slurm_output/olmoe-1.2b-baseline-shared-1gpu-rocm-%j.out
+#SBATCH --error=slurm_output/olmoe-1.2b-baseline-shared-1gpu-rocm-%j.err
+#SBATCH --partition=gpu
+#SBATCH --account=research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:amd:1
@@ -12,7 +11,8 @@
 
 export ROCM_HOME=/opt/rocm-6.4.3
 
-cd /home/morg/students/sagiahrac/repos/olmo-core-repo
+REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+cd "$REPO_DIR"
 
 source .venv/bin/activate
 

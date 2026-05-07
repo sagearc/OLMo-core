@@ -46,6 +46,44 @@ Or you can install from PyPI with:
 pip install ai2-olmo-core
 ```
 
+## MoE experiment materials
+
+This branch includes the MoE routing experiments and analysis scripts used for the paper figures. The scripts assume checkpoints are stored under `runs/` and tokenized OLMoE-style data is available locally.
+
+Set paths through environment variables rather than editing source files:
+
+```bash
+export OLMO_CORE_REPO_DIR="$PWD"
+export OLMO_DATA_ROOT="/path/to/olmoe-1pct"
+export OLMO_DATASET_DIR="$OLMO_DATA_ROOT/tokenized"
+export OLMO_EVAL_BASE_DIR="$OLMO_DATA_ROOT"
+```
+
+Prepare data:
+
+```bash
+DEST=/path/to/olmoe-100B ./prepare_data_driver.sh
+```
+
+Train a 1B MoE routing variant:
+
+```bash
+sbatch --job-name=moe-1b-deepseek --export=ALL,ROUTING=deepseek moe-1b.slurm
+```
+
+Valid `ROUTING` values are defined in `src/scripts/train/moe-1b.py`, including `baseline`, `deepseek`, `ema`, `ema_trend`, `ema_trend_damped`, `ema_centroid`, `ema_centroid_sph`, and `ema_centroid_sph_c2`. Set `WANDB_ENTITY`, `WANDB_PROJECT`, or `WANDB_DISABLED=1` in the submission environment if needed.
+
+Generate the main analysis plots from checkpoints under `runs/`:
+
+```bash
+python plot_router_logit_gate_coupling.py --run moe-1b-269440-deepseek --step 21000 --outdir figures
+python plot_router_heatmaps.py
+python plot_subspace_intervals.py
+python check_alignment.py
+```
+
+The router-score plot compares selected token-expert router scores against expert gate-neuron activation and writes both PNG and PDF outputs.
+
 There are a number of optional dependencies that must be installed to use certain functionality as well, including:
 
 - [flash-attn](https://github.com/Dao-AILab/flash-attention), [ring-flash-attn](https://github.com/zhuzilin/ring-flash-attention), and [TransformerEngine](https://github.com/NVIDIA/TransformerEngine) for the corresponding attention backends.
