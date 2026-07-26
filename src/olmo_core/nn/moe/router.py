@@ -39,6 +39,10 @@ if TYPE_CHECKING:
 __all__ = [
     "MoERouter",
     "MoELinearRouter",
+    "MoELeaveOneOutLinearRouter",
+    "MoEOrthogonalCentroidRouter",
+    "MoECentroidRouter",
+    "MoELeaveOneOutCentroidRouter",
     "MoERouterConfig",
     "MoERouterType",
     "MoERouterGatingFunction",
@@ -61,9 +65,9 @@ class _UniformExpertAssignment(torch.autograd.Function):
         return out.view(x.shape)
 
 
-_uniform_expert_assignment: Callable[
-    [torch.Tensor, int], torch.Tensor
-] = _UniformExpertAssignment.apply  # type: ignore
+_uniform_expert_assignment: Callable[[torch.Tensor, int], torch.Tensor] = (
+    _UniformExpertAssignment.apply
+)  # type: ignore
 
 
 class MoERouterType(StrEnum):
@@ -76,9 +80,24 @@ class MoERouterType(StrEnum):
     ➡️ :class:`MoELinearRouter`
     """
 
+    leave_one_out = "leave_one_out"
+    """
+    ➡️ :class:`MoELeaveOneOutLinearRouter`
+    """
+
     centroid = "centroid"
     """
     ➡️ :class:`MoECentroidRouter`
+    """
+
+    leave_one_out_centroid = "leave_one_out_centroid"
+    """
+    ➡️ :class:`MoELeaveOneOutCentroidRouter`
+    """
+
+    orthogonal_centroid = "orthogonal_centroid"
+    """
+    ➡️ :class:`MoEOrthogonalCentroidRouter`
     """
 
 
@@ -123,7 +142,27 @@ class MoERouterConfig(ModuleConfig):
 
     so the centroid step size tracks the optimizer's current LR and decays
     naturally with the cosine schedule.  ``centroid_alpha`` is ignored when
-    this is set.  Only used when ``name == MoERouterType.centroid``.
+    this is set. A value of zero leaves the initialized centroids fixed while
+    retaining the router's scoring and bias updates. Only used when
+    ``name == MoERouterType.centroid``.
+    """
+    orthogonal_projection_strength: float = 1.0
+    """
+    Fraction of the matched routed-centroid component removed from each learned
+    router row after every optimizer step. ``1.0`` enforces exact orthogonality
+    to the current EMA routed centroid. Only used by
+    :class:`MoEOrthogonalCentroidRouter`.
+    """
+    orthogonal_sham: bool = False
+    """
+    If true, rotate each router row by the same angle as matched-centroid
+    removal, but in a tangent direction derived from a fixed permutation of the
+    expert centroids. This controls for perturbation magnitude without targeting
+    the row's own routed centroid.
+    """
+    orthogonal_sham_seed: int = 6198
+    """
+    Seed for the fixed expert permutation used by the sham intervention.
     """
     bias_lr_lambda: Optional[float] = None
     """
@@ -243,9 +282,16 @@ class MoERouterConfig(ModuleConfig):
         :param d_model: The model dimensionality.
         """
         num_params = 0
-        if self.name == MoERouterType.default:
+        if self.name in (
+            MoERouterType.default,
+            MoERouterType.leave_one_out,
+            MoERouterType.orthogonal_centroid,
+        ):
             num_params += d_model * num_experts
-        elif self.name != MoERouterType.centroid:
+        elif self.name not in (
+            MoERouterType.centroid,
+            MoERouterType.leave_one_out_centroid,
+        ):
             raise NotImplementedError
 
         return num_params
@@ -284,13 +330,46 @@ class MoERouterConfig(ModuleConfig):
                 kwargs.pop("centroid_lr_lambda", None)
                 kwargs.pop("centroid_spherical", None)
                 kwargs.pop("num_centroids_per_expert", None)
+                kwargs.pop("orthogonal_projection_strength", None)
+                kwargs.pop("orthogonal_sham", None)
+                kwargs.pop("orthogonal_sham_seed", None)
                 if self.dtype is not None:
                     kwargs["dtype"] = self.dtype.as_pt()
                 elif dtype is not None:
                     kwargs["dtype"] = dtype
                 return MoELinearRouter(**kwargs)
+            elif self.name == MoERouterType.leave_one_out:
+                kwargs.pop("centroid_alpha", None)
+                kwargs.pop("centroid_lr_lambda", None)
+                kwargs.pop("centroid_spherical", None)
+                kwargs.pop("num_centroids_per_expert", None)
+                kwargs.pop("orthogonal_projection_strength", None)
+                kwargs.pop("orthogonal_sham", None)
+                kwargs.pop("orthogonal_sham_seed", None)
+                if self.dtype is not None:
+                    kwargs["dtype"] = self.dtype.as_pt()
+                elif dtype is not None:
+                    kwargs["dtype"] = dtype
+                return MoELeaveOneOutLinearRouter(**kwargs)
+            elif self.name == MoERouterType.orthogonal_centroid:
+                kwargs.pop("centroid_lr_lambda", None)
+                kwargs.pop("centroid_spherical", None)
+                kwargs.pop("num_centroids_per_expert", None)
+                if self.dtype is not None:
+                    kwargs["dtype"] = self.dtype.as_pt()
+                elif dtype is not None:
+                    kwargs["dtype"] = dtype
+                return MoEOrthogonalCentroidRouter(**kwargs)
             elif self.name == MoERouterType.centroid:
+                kwargs.pop("orthogonal_projection_strength", None)
+                kwargs.pop("orthogonal_sham", None)
+                kwargs.pop("orthogonal_sham_seed", None)
                 return MoECentroidRouter(**kwargs)
+            elif self.name == MoERouterType.leave_one_out_centroid:
+                kwargs.pop("orthogonal_projection_strength", None)
+                kwargs.pop("orthogonal_sham", None)
+                kwargs.pop("orthogonal_sham_seed", None)
+                return MoELeaveOneOutCentroidRouter(**kwargs)
             else:
                 raise NotImplementedError(self.name)
         except TypeError as e:
@@ -363,15 +442,15 @@ class MoERouter(nn.Module):
                 "ema_zscore_trend requires ema_zscore_normalize=True; it's a modifier "
                 "on the EMA path, not a standalone mode."
             )
-            assert (
-                0.0 < ema_zscore_trend_beta < 1.0
-            ), f"ema_zscore_trend_beta must be in (0, 1), got {ema_zscore_trend_beta}."
-            assert (
-                ema_zscore_trend_warmup >= 0
-            ), f"ema_zscore_trend_warmup must be >= 0, got {ema_zscore_trend_warmup}."
-            assert (
-                0.0 < ema_zscore_trend_damping <= 1.0
-            ), f"ema_zscore_trend_damping must be in (0, 1], got {ema_zscore_trend_damping}."
+            assert 0.0 < ema_zscore_trend_beta < 1.0, (
+                f"ema_zscore_trend_beta must be in (0, 1), got {ema_zscore_trend_beta}."
+            )
+            assert ema_zscore_trend_warmup >= 0, (
+                f"ema_zscore_trend_warmup must be >= 0, got {ema_zscore_trend_warmup}."
+            )
+            assert 0.0 < ema_zscore_trend_damping <= 1.0, (
+                f"ema_zscore_trend_damping must be in (0, 1], got {ema_zscore_trend_damping}."
+            )
         self.ema_zscore_trend_beta = ema_zscore_trend_beta
         self.ema_zscore_trend_warmup = ema_zscore_trend_warmup
         self.ema_zscore_trend_damping = ema_zscore_trend_damping
@@ -661,8 +740,7 @@ class MoERouter(nn.Module):
                 # step (seamless switch). Trend applies to the MEAN only; variance
                 # is always plain EMA.
                 use_trend = (
-                    self.ema_zscore_trend
-                    and self._ema_step_py >= self.ema_zscore_trend_warmup
+                    self.ema_zscore_trend and self._ema_step_py >= self.ema_zscore_trend_warmup
                 )
                 if use_trend:
                     assert self._ema_mean_trend is not None
@@ -862,7 +940,9 @@ class MoERouter(nn.Module):
             assert self.score_bias is not None
             with torch.no_grad():
                 _, expert_indices = torch.topk(
-                    scores + self.score_bias.unsqueeze(0), self.top_k, dim=-1  # type: ignore
+                    scores + self.score_bias.unsqueeze(0),
+                    self.top_k,
+                    dim=-1,  # type: ignore
                 )
             expert_weights = scores.gather(-1, expert_indices)
 
@@ -1100,6 +1180,13 @@ class MoERouter(nn.Module):
     def apply_cp(self, cp_mesh: DeviceMesh):
         self.cp_mesh = cp_mesh
 
+    @torch.no_grad()
+    def post_optim_step(self) -> None:
+        """
+        Hook for router interventions that must run immediately after the optimizer
+        updates learned router parameters.
+        """
+
 
 class MoELinearRouter(MoERouter):
     """
@@ -1167,6 +1254,305 @@ class MoELinearRouter(MoERouter):
         )
 
 
+class MoELeaveOneOutLinearRouter(MoELinearRouter):
+    """
+    Forward-matched leave-one-out intervention for a learned linear router.
+
+    Let ``s_i`` be the ordinary gated score for candidate expert ``i`` and let
+    ``T`` be the selected top-k set. The leave-one-out backward score is
+
+    .. math::
+
+        \\tilde s_T = -\\frac{1}{N-|T|}\\sum_{j \\notin T} s_j.
+
+    The module returns the ordinary selected scores in the forward pass, so
+    assignments, sigmoid weights, score-bias selection, and expert computation
+    exactly match the loss-free baseline. Autograd follows ``tilde s_T`` instead:
+    every selected router row is absent from the token's routing-weight gradient.
+    At top-1 this is exactly the candidate-wise leave-one-out score
+    ``-mean_{j != i}(s_j)``; at larger top-k it is the conservative set-wise
+    extension that preserves the same no-routed-row-update invariant.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.num_experts < 2:
+            raise OLMoConfigurationError("leave-one-out routing requires at least two experts.")
+        if self.top_k >= self.num_experts:
+            raise OLMoConfigurationError(
+                "leave-one-out routing requires top_k to be smaller than num_experts."
+            )
+
+    def get_top_k(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        expert_weights, expert_indices = super().get_top_k(scores)
+
+        selected = torch.zeros_like(scores, dtype=torch.bool)
+        selected.scatter_(-1, expert_indices, True)
+        complement_score = -scores.masked_fill(selected, 0.0).sum(dim=-1, keepdim=True) / (
+            self.num_experts - self.top_k
+        )
+
+        # Forward values are exactly the baseline's selected scores. Only the
+        # autograd dependency is replaced, and it contains no selected row.
+        return (
+            expert_weights.detach() + (complement_score - complement_score.detach()),
+            expert_indices,
+        )
+
+
+class MoEOrthogonalCentroidRouter(MoELinearRouter):
+    """
+    Learned linear routing with a causal routed-centroid intervention.
+
+    The matched mode removes each router row's component along the EMA centroid
+    of the hidden states assigned to that expert after every optimizer step, then
+    restores the row norm. The sham mode preserves the exact same per-row norm
+    and angular displacement but rotates using a fixed permutation of centroids.
+    """
+
+    def __init__(
+        self,
+        *,
+        centroid_alpha: float = 0.99,
+        orthogonal_projection_strength: float = 1.0,
+        orthogonal_sham: bool = False,
+        orthogonal_sham_seed: int = 6198,
+        init_device: str = "cpu",
+        **kwargs,
+    ):
+        if not 0.0 < centroid_alpha < 1.0:
+            raise OLMoConfigurationError(f"centroid_alpha must be in (0, 1), got {centroid_alpha}.")
+        if not 0.0 <= orthogonal_projection_strength <= 1.0:
+            raise OLMoConfigurationError(
+                "orthogonal_projection_strength must be in [0, 1], got "
+                f"{orthogonal_projection_strength}."
+            )
+        super().__init__(init_device=init_device, **kwargs)
+        self.centroid_alpha = centroid_alpha
+        self.orthogonal_projection_strength = orthogonal_projection_strength
+        self.orthogonal_sham = orthogonal_sham
+
+        self.register_buffer(
+            "_routed_centroid",
+            torch.zeros(self.num_experts, self.d_model, dtype=torch.float32, device=init_device),
+        )
+        self.register_buffer(
+            "_routed_centroid_step",
+            torch.zeros((), dtype=torch.long, device=init_device),
+        )
+        self.register_buffer(
+            "_last_projection_angle_mean",
+            torch.zeros((), dtype=torch.float32, device=init_device),
+        )
+        self.register_buffer(
+            "_last_projection_angle_max",
+            torch.zeros((), dtype=torch.float32, device=init_device),
+        )
+        self.register_buffer(
+            "_last_matched_cosine_abs_mean",
+            torch.zeros((), dtype=torch.float32, device=init_device),
+        )
+
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(orthogonal_sham_seed)
+        offset = (
+            int(torch.randint(1, self.num_experts, (), generator=generator).item())
+            if self.num_experts > 1
+            else 0
+        )
+        sham_permutation = (torch.arange(self.num_experts) + offset) % self.num_experts
+        self.register_buffer(
+            "_sham_centroid_permutation",
+            sham_permutation.to(device=init_device),
+        )
+
+        self._centroid_sum_accum: Optional[_HiddenTensor] = None
+        self._centroid_count_accum: Optional[_HiddenTensor] = None
+        self._routed_centroid_step_py = 0
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        self._routed_centroid_step_py = int(cast(torch.Tensor, self._routed_centroid_step).item())
+        self._centroid_sum_accum = None
+        self._centroid_count_accum = None
+
+    @torch.no_grad()
+    def _accumulate_routed_centroid(
+        self, flat_h: torch.Tensor, expert_indices: torch.Tensor
+    ) -> None:
+        num_tokens, d_model = flat_h.shape
+        repeated_h = (
+            flat_h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(num_tokens * self.top_k, d_model)
+        )
+        flat_indices = expert_indices.reshape(-1).long()
+        centroid_sum = torch.zeros(
+            self.num_experts, d_model, dtype=torch.float32, device=flat_h.device
+        )
+        centroid_count = torch.zeros(self.num_experts, dtype=torch.float32, device=flat_h.device)
+        centroid_sum.index_add_(0, flat_indices, repeated_h)
+        centroid_count.index_add_(
+            0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float32)
+        )
+        if self._centroid_sum_accum is None:
+            self._centroid_sum_accum = hide_from_torch(centroid_sum)
+            self._centroid_count_accum = hide_from_torch(centroid_count)
+        else:
+            unhide_from_torch(self._centroid_sum_accum).add_(centroid_sum)
+            assert self._centroid_count_accum is not None
+            unhide_from_torch(self._centroid_count_accum).add_(centroid_count)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        loss_div_factor: Optional[Union[torch.Tensor, float]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        expert_weights, expert_indices, batch_size_per_expert, aux_loss = super().forward(
+            x, loss_div_factor=loss_div_factor
+        )
+        if self.training and torch.is_grad_enabled():
+            with torch.no_grad():
+                self._accumulate_routed_centroid(
+                    x.detach().view(-1, self.d_model).float(),
+                    expert_indices.view(-1, self.top_k),
+                )
+        return expert_weights, expert_indices, batch_size_per_expert, aux_loss
+
+    @torch.no_grad()
+    def post_batch(self, dry_run: bool = False, lr: Optional[float] = None) -> None:
+        super().post_batch(dry_run=dry_run, lr=lr)
+        if self._centroid_sum_accum is None:
+            return
+        centroid_sum = unhide_from_torch(self._centroid_sum_accum)
+        assert self._centroid_count_accum is not None
+        centroid_count = unhide_from_torch(self._centroid_count_accum)
+        if is_distributed():
+            dist.all_reduce(centroid_sum, group=self.group)
+            dist.all_reduce(centroid_count, group=self.group)
+        if not dry_run:
+            has_tokens = centroid_count > 0
+            if has_tokens.any():
+                observation = centroid_sum[has_tokens] / centroid_count[has_tokens].unsqueeze(-1)
+                centroid = cast(torch.Tensor, self._routed_centroid)
+                centroid[has_tokens] = centroid[has_tokens].lerp(
+                    observation, 1.0 - self.centroid_alpha
+                )
+            cast(torch.Tensor, self._routed_centroid_step).add_(1)
+            self._routed_centroid_step_py += 1
+        self._centroid_sum_accum = None
+        self._centroid_count_accum = None
+
+    @staticmethod
+    def _stable_tangent(
+        direction: torch.Tensor, reference: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        tangent = reference - (reference * direction).sum(dim=-1, keepdim=True) * direction
+        tangent_norm = tangent.norm(dim=-1, keepdim=True)
+        needs_fallback = tangent_norm.squeeze(-1) <= eps
+        if needs_fallback.any():
+            basis_index = direction[needs_fallback].abs().argmin(dim=-1)
+            basis = torch.zeros_like(direction[needs_fallback])
+            basis.scatter_(1, basis_index.unsqueeze(-1), 1.0)
+            fallback = (
+                basis
+                - (basis * direction[needs_fallback]).sum(dim=-1, keepdim=True)
+                * direction[needs_fallback]
+            )
+            tangent[needs_fallback] = fallback
+            tangent_norm = tangent.norm(dim=-1, keepdim=True)
+        return tangent / tangent_norm.clamp_min(eps)
+
+    @torch.no_grad()
+    def post_optim_step(self) -> None:
+        if self._routed_centroid_step_py == 0:
+            return
+        local_weight = get_local_tensor(self.weight)
+        expected_numel = self.num_experts * self.d_model
+        if local_weight.numel() != expected_numel:
+            raise OLMoConfigurationError(
+                "orthogonal-centroid projection currently requires each rank to hold "
+                "the complete router weight; use the validated single-GPU configuration "
+                f"(local numel={local_weight.numel()}, expected={expected_numel})."
+            )
+
+        eps = torch.finfo(torch.float32).eps
+        rows = local_weight.view(self.num_experts, self.d_model)
+        rows_float = rows.float()
+        row_norm = rows_float.norm(dim=-1, keepdim=True)
+        row_hat = rows_float / row_norm.clamp_min(eps)
+        centroid = cast(torch.Tensor, self._routed_centroid).float()
+        centroid_norm = centroid.norm(dim=-1, keepdim=True)
+        active = centroid_norm.squeeze(-1) > eps
+        centroid_hat = centroid / centroid_norm.clamp_min(eps)
+
+        matched_component = (row_hat * centroid_hat).sum(dim=-1, keepdim=True)
+        matched_target = row_hat - (
+            self.orthogonal_projection_strength * matched_component * centroid_hat
+        )
+        matched_target_norm = matched_target.norm(dim=-1, keepdim=True)
+        degenerate = active & (matched_target_norm.squeeze(-1) <= eps)
+        if degenerate.any():
+            matched_target[degenerate] = self._stable_tangent(
+                centroid_hat[degenerate], row_hat[degenerate], eps
+            )
+            matched_target_norm = matched_target.norm(dim=-1, keepdim=True)
+        matched_target_hat = matched_target / matched_target_norm.clamp_min(eps)
+        matched_target_hat[~active] = row_hat[~active]
+        angle_cos = (row_hat * matched_target_hat).sum(dim=-1).clamp(-1.0, 1.0)
+        angle = torch.acos(angle_cos)
+
+        if self.orthogonal_sham:
+            sham_reference = centroid_hat[
+                cast(torch.Tensor, self._sham_centroid_permutation).long()
+            ]
+            sham_tangent = self._stable_tangent(row_hat, sham_reference, eps)
+            target_hat = (
+                torch.cos(angle).unsqueeze(-1) * row_hat
+                + torch.sin(angle).unsqueeze(-1) * sham_tangent
+            )
+            target_hat[~active] = row_hat[~active]
+        else:
+            target_hat = matched_target_hat
+        rows.copy_((target_hat * row_norm).to(dtype=rows.dtype))
+
+        final_hat = F.normalize(rows.float(), dim=-1)
+        matched_cosine = (final_hat * centroid_hat).sum(dim=-1)
+        active_angle = angle[active]
+        if active_angle.numel() > 0:
+            cast(torch.Tensor, self._last_projection_angle_mean).copy_(active_angle.mean())
+            cast(torch.Tensor, self._last_projection_angle_max).copy_(active_angle.max())
+            cast(torch.Tensor, self._last_matched_cosine_abs_mean).copy_(
+                matched_cosine[active].abs().mean()
+            )
+
+    @torch.no_grad()
+    def compute_metrics(
+        self, reset: bool = True
+    ) -> Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]]:
+        from olmo_core.train.common import ReduceType
+
+        out = super().compute_metrics(reset=False)
+        out["routed centroid step"] = (
+            cast(torch.Tensor, self._routed_centroid_step).float(),
+            ReduceType.mean,
+        )
+        out["centroid projection angle mean"] = (
+            cast(torch.Tensor, self._last_projection_angle_mean),
+            ReduceType.mean,
+        )
+        out["centroid projection angle max"] = (
+            cast(torch.Tensor, self._last_projection_angle_max),
+            ReduceType.max,
+        )
+        out["matched router-centroid cosine abs mean"] = (
+            cast(torch.Tensor, self._last_matched_cosine_abs_mean),
+            ReduceType.mean,
+        )
+        if reset:
+            self.reset_metrics()
+        return out
+
+
 class MoECentroidRouter(MoERouter):
     """
     Gradient-free EMA centroid router implementing the primal-dual algorithm for
@@ -1230,8 +1616,10 @@ class MoECentroidRouter(MoERouter):
 
         # Random unit vectors — shape (K*C, d_model).
         centroid_init = torch.randn(
-            self.num_experts * num_centroids_per_expert, self.d_model,
-            dtype=torch.float32, device=init_device,
+            self.num_experts * num_centroids_per_expert,
+            self.d_model,
+            dtype=torch.float32,
+            device=init_device,
         )
         F.normalize(centroid_init, dim=-1, out=centroid_init)
         self.register_buffer("_centroid", centroid_init)
@@ -1347,9 +1735,9 @@ class MoECentroidRouter(MoERouter):
             one_minus_alpha = self.centroid_lr_lambda * lr
         else:
             one_minus_alpha = 1.0 - self.centroid_alpha
-        if not (0.0 < one_minus_alpha <= 1.0):
+        if not (0.0 <= one_minus_alpha <= 1.0):
             raise OLMoConfigurationError(
-                f"centroid step size must be in (0, 1]; got {one_minus_alpha:.6f} "
+                f"centroid step size must be in [0, 1]; got {one_minus_alpha:.6f} "
                 f"(centroid_lr_lambda={self.centroid_lr_lambda}, lr={lr})"
             )
 
@@ -1438,3 +1826,91 @@ class MoECentroidRouter(MoERouter):
         if reset:
             self.reset_metrics()
         return out
+
+
+class MoELeaveOneOutCentroidRouter(MoECentroidRouter):
+    """
+    Repulsive leave-one-out M-step for the gradient-free centroid router.
+
+    Forward routing is exactly matched to :class:`MoECentroidRouter`. The causal
+    intervention changes only the centroid M-step. For token ``x`` with selected
+    set ``T``, selected centroids receive no update from ``x`` and every
+    unselected centroid receives ``-x``:
+
+    .. math::
+
+        c_j \\leftarrow \\alpha c_j - (1 - \\alpha)
+        \\operatorname{mean}\\{x_t : j \\notin T_t\\}.
+
+    This is a repulsive update: a token lowers the future dot-product score of
+    every expert it did not select. With ``centroid_spherical=True`` the negative
+    observation and the updated centroid are normalized, so the intervention
+    changes direction without allowing centroid magnitudes to drift.
+
+    This first implementation intentionally supports one centroid per expert,
+    matching the successful ``ema_centroid`` paper variant. Multi-centroid
+    winner-takes-all semantics need a separate causal definition.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.num_experts < 2:
+            raise OLMoConfigurationError("leave-one-out routing requires at least two experts.")
+        if self.top_k >= self.num_experts:
+            raise OLMoConfigurationError(
+                "leave-one-out centroid routing requires top_k to be smaller than num_experts."
+            )
+        if self.num_centroids_per_expert != 1:
+            raise OLMoConfigurationError(
+                "leave-one-out centroid routing currently requires exactly one centroid per expert."
+            )
+
+    @torch.no_grad()
+    def _accumulate_centroid(self, flat_h: torch.Tensor, expert_indices: torch.Tensor) -> None:
+        num_tokens, d_model = flat_h.shape
+        if expert_indices.shape != (num_tokens, self.top_k):
+            raise OLMoConfigurationError(
+                "leave-one-out centroid assignments must have shape "
+                f"({num_tokens}, {self.top_k}), got {tuple(expert_indices.shape)}."
+            )
+
+        # Start with every token assigned to every centroid, then subtract each
+        # token from the centroids selected for it. Thus no routed centroid can
+        # absorb that token, including when top_k > 1.
+        token_sum = flat_h.sum(dim=0, keepdim=True)
+        centroid_sum = token_sum.expand(self.num_experts, d_model).clone()
+        centroid_count = torch.full(
+            (self.num_experts,),
+            float(num_tokens),
+            dtype=torch.float32,
+            device=flat_h.device,
+        )
+
+        excluded_indices = expert_indices.reshape(-1).long()
+        repeated_h = (
+            flat_h.unsqueeze(1).expand(-1, self.top_k, -1).reshape(num_tokens * self.top_k, d_model)
+        )
+        centroid_sum.index_add_(0, excluded_indices, -repeated_h)
+        centroid_count.index_add_(
+            0,
+            excluded_indices,
+            -torch.ones_like(excluded_indices, dtype=torch.float32),
+        )
+
+        if self._centroid_sum_accum is None:
+            self._centroid_sum_accum = hide_from_torch(centroid_sum)
+            self._centroid_count_accum = hide_from_torch(centroid_count)
+        else:
+            unhide_from_torch(self._centroid_sum_accum).add_(centroid_sum)
+            assert self._centroid_count_accum is not None
+            unhide_from_torch(self._centroid_count_accum).add_(centroid_count)
+
+    @torch.no_grad()
+    def post_batch(self, dry_run: bool = False, lr: Optional[float] = None) -> None:
+        # The accumulator is the mean of tokens that did not route to each
+        # expert. Negating its numerator turns the inherited EMA M-step into a
+        # repulsive update while preserving its distributed reduction, LR-tied
+        # step size, spherical normalization, and checkpointed centroid state.
+        if self._centroid_sum_accum is not None:
+            unhide_from_torch(self._centroid_sum_accum).neg_()
+        super().post_batch(dry_run=dry_run, lr=lr)

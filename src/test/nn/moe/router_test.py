@@ -1,7 +1,18 @@
+from copy import deepcopy
+
 import pytest
 import torch
 
-from olmo_core.nn.moe.router import MoELinearRouter, MoERouterGatingFunction
+from olmo_core.nn.moe.router import (
+    MoECentroidRouter,
+    MoELeaveOneOutCentroidRouter,
+    MoELeaveOneOutLinearRouter,
+    MoELinearRouter,
+    MoEOrthogonalCentroidRouter,
+    MoERouterConfig,
+    MoERouterGatingFunction,
+    MoERouterType,
+)
 from olmo_core.testing import DEVICES
 
 
@@ -82,6 +93,464 @@ def test_router_with_bias_gamma(device: torch.device):
     assert router1.score_bias.nonzero().sum().item() > 0  # type: ignore
     assert router1.score_bias_batch_size_per_expert is not None
     assert router1.score_bias_batch_size_per_expert.nonzero().sum().item() == 0
+
+
+def test_router_config_builds_router_variants():
+    assert isinstance(MoERouterConfig().build(8, 4), MoELinearRouter)
+    assert isinstance(
+        MoERouterConfig(name=MoERouterType.leave_one_out).build(8, 4),
+        MoELeaveOneOutLinearRouter,
+    )
+    assert isinstance(
+        MoERouterConfig(name=MoERouterType.orthogonal_centroid).build(8, 4),
+        MoEOrthogonalCentroidRouter,
+    )
+    assert isinstance(
+        MoERouterConfig(name=MoERouterType.leave_one_out_centroid).build(8, 4),
+        MoELeaveOneOutCentroidRouter,
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_leave_one_out_linear_top1_excludes_routed_row_update(
+    device: torch.device,
+):
+    # Deliberately omit L1 renormalization here: at top-1 it makes the sole
+    # mixing weight identically one and therefore removes every router gradient.
+    # This test isolates the leave-one-out dependency graph itself.
+    router = MoELeaveOneOutLinearRouter(
+        d_model=2,
+        num_experts=3,
+        top_k=1,
+        gating_function=MoERouterGatingFunction.sigmoid,
+    ).to(device)
+    with torch.no_grad():
+        router.weight.view(3, 2).copy_(
+            torch.tensor(
+                [[2.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+                device=device,
+            )
+        )
+
+    x = torch.tensor([[[1.0, 0.0]]], device=device)
+    logits = router.get_expert_logits(x)
+    torch.testing.assert_close(
+        logits,
+        torch.tensor([[[2.0, 0.0, -1.0]]], device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+    expert_weights, expert_indices, _, _ = router(x)
+    assert expert_indices.item() == 0
+
+    baseline = MoELinearRouter(
+        d_model=2,
+        num_experts=3,
+        top_k=1,
+        gating_function=MoERouterGatingFunction.sigmoid,
+    ).to(device)
+    with torch.no_grad():
+        baseline.weight.copy_(router.weight)
+    baseline_weights, baseline_indices, _, _ = baseline(x)
+    torch.testing.assert_close(expert_weights, baseline_weights, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(expert_indices, baseline_indices, rtol=0.0, atol=0.0)
+
+    # Minimal one-token MoE: gather the routed expert's scalar response, mix it
+    # by the router weight, and backpropagate a task loss through that output.
+    expert_responses = torch.tensor([1.5, -0.75, 0.25], device=device)
+    model_output = (expert_weights * expert_responses[expert_indices]).sum()
+    loss = (model_output - 0.25).square()
+
+    rows_before = router.weight.detach().view(3, 2).clone()
+    loss.backward()
+    assert router.weight.grad is not None
+    grad = router.weight.grad.view(3, 2)
+    torch.testing.assert_close(grad[0], torch.zeros_like(grad[0]), rtol=0.0, atol=0.0)
+    assert grad[1].norm() > 0
+    assert grad[2].norm() > 0
+
+    torch.optim.SGD(router.parameters(), lr=0.1).step()
+    rows_after = router.weight.detach().view(3, 2)
+    torch.testing.assert_close(rows_after[0], rows_before[0], rtol=0.0, atol=0.0)
+    assert not torch.equal(rows_after[1], rows_before[1])
+    assert not torch.equal(rows_after[2], rows_before[2])
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_leave_one_out_linear_top6_excludes_all_routed_row_updates(
+    device: torch.device,
+):
+    router = MoELeaveOneOutLinearRouter(
+        d_model=2,
+        num_experts=8,
+        top_k=6,
+        gating_function=MoERouterGatingFunction.sigmoid,
+        normalize_expert_weights=1.0,
+    ).to(device)
+    with torch.no_grad():
+        router.weight.view(8, 2).copy_(
+            torch.tensor(
+                [
+                    [4.0, 0.0],
+                    [3.0, 0.0],
+                    [2.0, 0.0],
+                    [1.0, 0.0],
+                    [0.5, 0.0],
+                    [0.25, 0.0],
+                    [-1.0, 0.0],
+                    [-2.0, 0.0],
+                ],
+                device=device,
+            )
+        )
+
+    x = torch.tensor([[[1.0, 0.0]]], device=device)
+    expert_weights, expert_indices, _, _ = router(x)
+    selected = expert_indices.flatten()
+    torch.testing.assert_close(
+        selected.sort().values,
+        torch.arange(6, device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    baseline = MoELinearRouter(
+        d_model=2,
+        num_experts=8,
+        top_k=6,
+        gating_function=MoERouterGatingFunction.sigmoid,
+        normalize_expert_weights=1.0,
+    ).to(device)
+    with torch.no_grad():
+        baseline.weight.copy_(router.weight)
+    baseline_weights, baseline_indices, _, _ = baseline(x)
+    torch.testing.assert_close(expert_weights, baseline_weights, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(expert_indices, baseline_indices, rtol=0.0, atol=0.0)
+
+    expert_responses = torch.arange(1, 9, dtype=x.dtype, device=device)
+    model_output = (expert_weights * expert_responses[expert_indices]).sum()
+    model_output.square().backward()
+    assert router.weight.grad is not None
+    grad = router.weight.grad.view(8, 2)
+    torch.testing.assert_close(grad[:6], torch.zeros_like(grad[:6]), rtol=0.0, atol=0.0)
+    assert grad[6].norm() > 0
+    assert grad[7].norm() > 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_leave_one_out_centroid_top1_repels_unrouted_centroids(
+    device: torch.device,
+):
+    router = MoELeaveOneOutCentroidRouter(
+        d_model=2,
+        num_experts=3,
+        top_k=1,
+        gating_function=MoERouterGatingFunction.identity,
+        centroid_alpha=0.5,
+    ).to(device)
+    with torch.no_grad():
+        router._centroid.copy_(
+            torch.tensor(
+                [[1.0, 0.0], [0.0, 1.0], [0.0, -1.0]],
+                device=device,
+            )
+        )
+
+    x = torch.tensor([[[2.0, 1.0]]], device=device)
+    expert_weights, expert_indices, _, _ = router(x)
+    assert expert_indices.item() == 0
+
+    baseline = MoECentroidRouter(
+        d_model=2,
+        num_experts=3,
+        top_k=1,
+        gating_function=MoERouterGatingFunction.identity,
+        centroid_alpha=0.5,
+    ).to(device)
+    with torch.no_grad():
+        baseline._centroid.copy_(router._centroid)
+    baseline_weights, baseline_indices, _, _ = baseline(x)
+    torch.testing.assert_close(expert_weights, baseline_weights, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(expert_indices, baseline_indices, rtol=0.0, atol=0.0)
+
+    centroids_before = router._centroid.clone()
+
+    router.post_batch()
+    torch.testing.assert_close(router._centroid[0], centroids_before[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        router._centroid[1],
+        torch.tensor([-1.0, 0.0], device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        router._centroid[2],
+        torch.tensor([-1.0, -1.0], device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_leave_one_out_centroid_top6_repels_all_unrouted_centroids(
+    device: torch.device,
+):
+    router = MoELeaveOneOutCentroidRouter(
+        d_model=2,
+        num_experts=8,
+        top_k=6,
+        gating_function=MoERouterGatingFunction.identity,
+        centroid_alpha=0.5,
+    ).to(device)
+    with torch.no_grad():
+        router._centroid.copy_(
+            torch.tensor(
+                [
+                    [4.0, 0.0],
+                    [3.0, 0.0],
+                    [2.0, 0.0],
+                    [1.0, 0.0],
+                    [0.5, 0.0],
+                    [0.25, 0.0],
+                    [-1.0, 0.0],
+                    [-2.0, 0.0],
+                ],
+                device=device,
+            )
+        )
+
+    x = torch.tensor([[[1.0, 0.0]]], device=device)
+    expert_weights, expert_indices, _, _ = router(x)
+    selected = expert_indices.flatten()
+    torch.testing.assert_close(
+        selected.sort().values,
+        torch.arange(6, device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    baseline = MoECentroidRouter(
+        d_model=2,
+        num_experts=8,
+        top_k=6,
+        gating_function=MoERouterGatingFunction.identity,
+        centroid_alpha=0.5,
+    ).to(device)
+    with torch.no_grad():
+        baseline._centroid.copy_(router._centroid)
+    baseline_weights, baseline_indices, _, _ = baseline(x)
+    torch.testing.assert_close(expert_weights, baseline_weights, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(expert_indices, baseline_indices, rtol=0.0, atol=0.0)
+
+    centroids_before = router._centroid.clone()
+    router.post_batch()
+    torch.testing.assert_close(
+        router._centroid[:6],
+        centroids_before[:6],
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        router._centroid[6],
+        torch.tensor([-1.0, 0.0], device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        router._centroid[7],
+        torch.tensor([-1.5, 0.0], device=device),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_leave_one_out_centroid_spherical_repulsion_preserves_magnitude(
+    device: torch.device,
+):
+    router = MoELeaveOneOutCentroidRouter(
+        d_model=3,
+        num_experts=3,
+        top_k=1,
+        gating_function=MoERouterGatingFunction.identity,
+        centroid_alpha=0.5,
+        centroid_spherical=True,
+    ).to(device)
+    with torch.no_grad():
+        router._centroid.copy_(torch.eye(3, device=device))
+
+    x = torch.tensor([[[2.0, 1.0, 0.0]]], device=device)
+    _, expert_indices, _, _ = router(x)
+    assert expert_indices.item() == 0
+    selected_before = router._centroid[0].clone()
+
+    router.post_batch()
+
+    torch.testing.assert_close(
+        router._centroid.norm(dim=-1),
+        torch.ones(3, device=device),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        router._centroid[0],
+        selected_before,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert (x.flatten() @ router._centroid[1]) < (x.flatten() @ torch.eye(3, device=device)[1])
+    assert (x.flatten() @ router._centroid[2]) < (x.flatten() @ torch.eye(3, device=device)[2])
+
+
+def test_leave_one_out_centroid_is_not_an_adamw_parameter():
+    router = MoELeaveOneOutCentroidRouter(
+        d_model=4,
+        num_experts=3,
+        top_k=1,
+        gating_function=MoERouterGatingFunction.identity,
+        centroid_spherical=True,
+    )
+    assert list(router.named_parameters()) == []
+    assert "_centroid" in dict(router.named_buffers())
+
+    adjacent = torch.nn.Linear(4, 4, bias=False)
+    optimizer = torch.optim.AdamW(adjacent.parameters(), lr=1e-3, weight_decay=0.1)
+    optimizer.zero_grad()
+    adjacent(torch.ones(1, 4)).square().mean().backward()
+    optimizer.step()
+
+    assert set(optimizer.state) == {adjacent.weight}
+    assert router._centroid not in optimizer.state
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_orthogonal_centroid_projection_is_matched_and_post_optim(device: torch.device):
+    router = MoEOrthogonalCentroidRouter(
+        d_model=16,
+        num_experts=4,
+        top_k=4,
+        gating_function=MoERouterGatingFunction.sigmoid,
+        normalize_expert_weights=1.0,
+        centroid_alpha=0.5,
+    ).to(device)
+    router.train()
+    x = torch.randn((2, 8, 16), device=device)
+    weight_before = router.weight.detach().clone()
+    router(x)
+    router.post_batch()
+    torch.testing.assert_close(router.weight, weight_before, rtol=0.0, atol=0.0)
+
+    rows_before = router.weight.detach().view(4, 16).float().clone()
+    norms_before = rows_before.norm(dim=-1)
+    router.post_optim_step()
+    rows_after = router.weight.detach().view(4, 16).float()
+    centroid_hat = torch.nn.functional.normalize(router._routed_centroid, dim=-1)
+    cosine_after = (torch.nn.functional.normalize(rows_after, dim=-1) * centroid_hat).sum(dim=-1)
+    torch.testing.assert_close(rows_after.norm(dim=-1), norms_before, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(cosine_after, torch.zeros_like(cosine_after), rtol=0.0, atol=2e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_orthogonal_centroid_sham_matches_angle_and_norm(device: torch.device):
+    common = dict(
+        d_model=16,
+        num_experts=4,
+        top_k=4,
+        gating_function=MoERouterGatingFunction.sigmoid,
+        normalize_expert_weights=1.0,
+        centroid_alpha=0.5,
+        orthogonal_sham_seed=17,
+    )
+    matched = MoEOrthogonalCentroidRouter(**common).to(device)
+    sham = MoEOrthogonalCentroidRouter(**common, orthogonal_sham=True).to(device)
+    with torch.no_grad():
+        sham.weight.copy_(matched.weight)
+        centroid = torch.randn((4, 16), device=device)
+        matched._routed_centroid.copy_(centroid)
+        sham._routed_centroid.copy_(centroid)
+        matched._routed_centroid_step.add_(1)
+        sham._routed_centroid_step.add_(1)
+    matched._routed_centroid_step_py = 1
+    sham._routed_centroid_step_py = 1
+
+    rows_before = matched.weight.detach().view(4, 16).float().clone()
+    norms_before = rows_before.norm(dim=-1)
+    matched.post_optim_step()
+    sham.post_optim_step()
+    matched_rows = matched.weight.detach().view(4, 16).float()
+    sham_rows = sham.weight.detach().view(4, 16).float()
+
+    def angle(rows_after: torch.Tensor) -> torch.Tensor:
+        before_hat = torch.nn.functional.normalize(rows_before, dim=-1)
+        after_hat = torch.nn.functional.normalize(rows_after, dim=-1)
+        return torch.acos((before_hat * after_hat).sum(dim=-1).clamp(-1.0, 1.0))
+
+    torch.testing.assert_close(angle(sham_rows), angle(matched_rows), rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(sham_rows.norm(dim=-1), norms_before, rtol=2e-5, atol=2e-6)
+    centroid_hat = torch.nn.functional.normalize(sham._routed_centroid, dim=-1)
+    sham_matched_cosine = (torch.nn.functional.normalize(sham_rows, dim=-1) * centroid_hat).sum(
+        dim=-1
+    )
+    assert sham_matched_cosine.abs().mean() > 1e-3
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_orthogonal_centroid_dry_run_does_not_commit(device: torch.device):
+    router = MoEOrthogonalCentroidRouter(d_model=16, num_experts=4, top_k=2).to(device)
+    router.train()
+    router(torch.randn((2, 8, 16), device=device))
+    router.post_batch(dry_run=True)
+    assert router._routed_centroid_step_py == 0
+    assert router._routed_centroid.abs().sum() == 0
+    assert router._centroid_sum_accum is None
+    assert router._centroid_count_accum is None
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("sham", [False, True], ids=["matched", "sham"])
+def test_orthogonal_centroid_state_dict_resume(device: torch.device, sham: bool):
+    kwargs = dict(
+        d_model=16,
+        num_experts=4,
+        top_k=2,
+        centroid_alpha=0.5,
+        orthogonal_sham=sham,
+        orthogonal_sham_seed=23,
+    )
+    router1 = MoEOrthogonalCentroidRouter(**kwargs).to(device)
+    router1.train()
+    optim1 = torch.optim.AdamW(router1.parameters(), lr=1e-3)
+
+    def training_step(
+        router: MoEOrthogonalCentroidRouter,
+        optimizer: torch.optim.Optimizer,
+        x: torch.Tensor,
+    ) -> None:
+        optimizer.zero_grad(set_to_none=True)
+        expert_weights, _, _, _ = router(x)
+        expert_weights.float().square().mean().backward()
+        router.post_batch(lr=1e-3)
+        optimizer.step()
+        router.post_optim_step()
+
+    torch.manual_seed(19)
+    training_step(router1, optim1, torch.randn((2, 8, 16), device=device))
+
+    router2 = MoEOrthogonalCentroidRouter(**kwargs).to(device)
+    router2.load_state_dict(router1.state_dict())
+    router2.train()
+    optim2 = torch.optim.AdamW(router2.parameters(), lr=1e-3)
+    optim2.load_state_dict(deepcopy(optim1.state_dict()))
+    assert router2._routed_centroid_step_py == router1._routed_centroid_step_py == 1
+    assert router2._centroid_sum_accum is None
+    assert router2._centroid_count_accum is None
+
+    next_x = torch.randn((2, 8, 16), device=device)
+    training_step(router1, optim1, next_x)
+    training_step(router2, optim2, next_x)
+    torch.testing.assert_close(router2.weight, router1.weight)
+    torch.testing.assert_close(router2._routed_centroid, router1._routed_centroid)
+    assert router2._routed_centroid_step_py == router1._routed_centroid_step_py == 2
 
 
 @pytest.mark.parametrize("device", DEVICES)

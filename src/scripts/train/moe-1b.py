@@ -24,6 +24,9 @@ Usage:
     where VARIANT is one of:
         baseline          softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
         deepseek          sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
+        deepseek_leave_one_out
+                          exact `deepseek` forward routing, but the selected candidate's
+                          backward score excludes all routed router rows
         deepseek_router_centroid_init
                           exact `deepseek` routing after normally initialized expert
                           neurons are regrouped around initialized router rows
@@ -36,12 +39,24 @@ Usage:
         ema_centroid      gradient-free EMA centroid routing + dual bias — primal-dual
                           algorithm for capacity-constrained clustering; no router params,
                           no aux losses, zero inter-centroid gradient coupling
+        ema_centroid_leave_one_out
+                          exact `ema_centroid` forward routing, but selected experts'
+                          centroids are excluded from that token's M-step
         ema_centroid_sph  as `ema_centroid` but with spherical k-means M-step: observed
                           cluster mean is L2-normalised before the lerp, keeping centroids
                           on the unit sphere — consistent with the cosine similarity score
         ema_centroid_sph_c2  as `ema_centroid_sph` but with 2 sub-centroids per expert
                           (128 total); expert score = max cosine sim over its 2 sub-centroids,
                           M-step updates the winning sub-centroid (winner-takes-all)
+        frozen_random_centroid
+                          exact `ema_centroid` control with fixed random centroids and
+                          the same adaptive-bias rule
+        orthogonal_centroid
+                          exact `deepseek` learned router, with each router row projected
+                          orthogonal to its own EMA routed-input centroid after every step
+        orthogonal_centroid_sham
+                          perturbation control with the same per-row norm and rotation
+                          angle, but tangent directions from permuted expert centroids
 """
 
 import os
@@ -95,6 +110,8 @@ EVAL_BASE_DIR = os.environ.get("OLMO_EVAL_BASE_DIR", DATA_ROOT)
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY") or None
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "MoE")
 WANDB_ENABLED = os.environ.get("WANDB_DISABLED", "0") != "1"
+SAVE_ROOT = os.environ.get("OLMO_SAVE_ROOT", REPO_DIR)
+CHECKPOINTS_ENABLED = os.environ.get("OLMO_DISABLE_CHECKPOINTS", "0") != "1"
 
 DATA_PATHS = [
     f"{DATASET_DIR}/algebraic-stack/part-0-00000.npy",
@@ -138,12 +155,14 @@ DATA_PATHS = [
 class RoutingVariant(StrEnum):
     baseline = "baseline"
     deepseek = "deepseek"
+    deepseek_leave_one_out = "deepseek_leave_one_out"
     deepseek_router_centroid_init = "deepseek_router_centroid_init"
     ema = "ema"
     ema_trend = "ema_trend"
     ema_trend_damped = "ema_trend_damped"
     ema_trend_bias = "ema_trend_bias"
     ema_centroid = "ema_centroid"
+    ema_centroid_leave_one_out = "ema_centroid_leave_one_out"
     ema_centroid_randinit = "ema_centroid_randinit"
     ema_centroid_deepseek = "ema_centroid_deepseek"
     ema_centroid_deepseek_c2 = "ema_centroid_deepseek_c2"
@@ -151,6 +170,9 @@ class RoutingVariant(StrEnum):
     ema_centroid_sph_c2 = "ema_centroid_sph_c2"
     baseline_no_loss = "baseline_no_loss"
     deepseek_v3 = "deepseek_v3"
+    frozen_random_centroid = "frozen_random_centroid"
+    orthogonal_centroid = "orthogonal_centroid"
+    orthogonal_centroid_sham = "orthogonal_centroid_sham"
 
 
 def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
@@ -164,10 +186,7 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         # (lb=0.01) AND router z-loss (z=0.001). The classic OLMoE / Mixtral recipe.
         return
 
-    if variant in (
-        RoutingVariant.deepseek,
-        RoutingVariant.deepseek_router_centroid_init,
-    ):
+    if variant == RoutingVariant.deepseek:
         # arXiv:2408.15664 (§4) — strict "Auxiliary-Loss-Free Load Balancing":
         # sigmoid → bias-shifted top-k → unbiased gather → L1 renorm → bias update
         # by sign(ideal − actual). γ=u=1e-3 per §4.3 ("Update rate"). NO standard
@@ -179,9 +198,54 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.router.normalize_expert_weights = 1.0
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
-        moe.reorganize_expert_init_by_router = (
-            variant == RoutingVariant.deepseek_router_centroid_init
-        )
+        return
+
+    if variant == RoutingVariant.deepseek_leave_one_out:
+        # Exact DeepSeek loss-free forward pass and bias rule. The returned
+        # weights and assignments are numerically identical to `deepseek`, but
+        # their backward score is the negative mean over unselected router
+        # scores. Thus no routed row receives gradient from that token.
+        moe.router.name = MoERouterType.leave_one_out
+        moe.router.gating_function = MoERouterGatingFunction.sigmoid
+        moe.router.bias_gamma = 1e-3
+        moe.router.normalize_expert_weights = 1.0
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.deepseek_router_centroid_init:
+        # Exact DeepSeek loss-free routing and optimization. First initialize
+        # the router and all expert weights exactly as usual. Then use the
+        # actual initialized router rows as fixed K-means centroids and
+        # reorganize whole SwiGLU neurons into balanced expert clusters.
+        # This is a pure permutation: no initialized value or scale changes.
+        moe.router.gating_function = MoERouterGatingFunction.sigmoid
+        moe.router.bias_gamma = 1e-3
+        moe.router.normalize_expert_weights = 1.0
+        moe.reorganize_expert_init_by_router = True
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant in (
+        RoutingVariant.orthogonal_centroid,
+        RoutingVariant.orthogonal_centroid_sham,
+    ):
+        # Exact DeepSeek learned-router setup plus one causal intervention.
+        # Matched mode removes the component of router row i along the EMA of
+        # hidden states routed to expert i after every optimizer step. Sham mode
+        # preserves the same row norm and per-step rotation angle but obtains its
+        # tangent direction from a fixed derangement of expert centroids.
+        moe.router.name = MoERouterType.orthogonal_centroid
+        moe.router.gating_function = MoERouterGatingFunction.sigmoid
+        moe.router.bias_gamma = 1e-3
+        moe.router.normalize_expert_weights = 1.0
+        moe.router.centroid_alpha = 0.99
+        moe.router.orthogonal_projection_strength = 1.0
+        moe.router.orthogonal_sham = variant == RoutingVariant.orthogonal_centroid_sham
+        moe.router.orthogonal_sham_seed = 6198
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
         return
 
     if variant == RoutingVariant.deepseek_v3:
@@ -266,7 +330,11 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.z_loss_weight = None
         return
 
-    if variant in (RoutingVariant.ema_centroid, RoutingVariant.ema_centroid_randinit):
+    if variant in (
+        RoutingVariant.ema_centroid,
+        RoutingVariant.ema_centroid_randinit,
+        RoutingVariant.frozen_random_centroid,
+    ):
         # Primal-dual algorithm for capacity-constrained online clustering (paper §3).
         #
         # Primal (M-step): c_k ← α_t·c_k + (1-α_t)·mean_{assigned}(h)
@@ -282,8 +350,28 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         # No auxiliary losses, no router weight parameters, no static hyperparameters.
         # (ema_centroid_randinit is a legacy alias — init is always random unit vectors.)
         moe.router.name = MoERouterType.centroid
+        # The frozen control has the identical random-unit initialization, cosine
+        # scores, and adaptive-bias rule, but a zero M-step. Thus the only
+        # difference from EMA centroid routing is input-driven centroid tracking.
+        moe.router.centroid_lr_lambda = (
+            0.0 if variant == RoutingVariant.frozen_random_centroid else 10.0
+        )
+        moe.router.bias_lr_lambda = 1.0
+        moe.router.gating_function = MoERouterGatingFunction.identity
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.ema_centroid_leave_one_out:
+        # Exact successful `ema_centroid` forward routing and dual-bias rule.
+        # The repulsive M-step excludes every selected centroid and moves every
+        # unselected centroid in the negative token direction. Spherical
+        # normalization keeps all centroid norms exactly one, isolating the
+        # directional intervention from score-scale drift.
+        moe.router.name = MoERouterType.leave_one_out_centroid
         moe.router.centroid_lr_lambda = 10.0
         moe.router.bias_lr_lambda = 1.0
+        moe.router.centroid_spherical = True
         moe.router.gating_function = MoERouterGatingFunction.identity
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
@@ -467,23 +555,34 @@ def build_config(run_name: str, routing: RoutingVariant, overrides: List[str]) -
     # Tag the WandB run with the routing variant so charts can be grouped.
     wandb_name = f"{run_name}-{routing.value}"
 
-    trainer_config = (
-        TrainerConfig(
-            save_folder=f"{REPO_DIR}/runs/{wandb_name}",
-            save_overwrite=True,
-            metrics_collect_interval=10,
-            cancel_check_interval=1,
-            max_duration=Duration.tokens(MAX_TOKENS),
-        )
-        .with_callback("gpu_monitor", GPUMemoryMonitorCallback())
-        .with_callback(
+    trainer_config = TrainerConfig(
+        save_folder=f"{SAVE_ROOT}/runs/{wandb_name}",
+        save_overwrite=True,
+        metrics_collect_interval=10,
+        cancel_check_interval=1,
+        max_duration=Duration.tokens(MAX_TOKENS),
+    ).with_callback("gpu_monitor", GPUMemoryMonitorCallback())
+    if CHECKPOINTS_ENABLED:
+        # Stagger node-local ephemeral checkpoints across the three causal
+        # variants so they do not all transiently hold two checkpoint copies
+        # at once. Slurm requeues killable jobs with the same job ID, allowing
+        # Trainer to auto-resume from this save folder on n-h200.
+        ephemeral_save_interval = {
+            RoutingVariant.deepseek_leave_one_out: 64,
+            RoutingVariant.ema_centroid_leave_one_out: 72,
+            RoutingVariant.deepseek_router_centroid_init: 80,
+        }.get(routing, 80)
+        trainer_config = trainer_config.with_callback(
             "checkpointer",
             CheckpointerCallback(
-                save_interval=250,
-                ephemeral_save_interval=200,
+                save_interval=1000,
+                ephemeral_save_interval=ephemeral_save_interval,
+                pre_train_checkpoint=False,
                 save_async=True,
             ),
         )
+    trainer_config = (
+        trainer_config
         .with_callback(
             "wandb",
             WandBCallback(
