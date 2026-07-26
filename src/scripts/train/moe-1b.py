@@ -24,6 +24,9 @@ Usage:
     where VARIANT is one of:
         baseline          softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
         deepseek          sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
+        deepseek_router_centroid_init
+                          exact `deepseek` routing after normally initialized expert
+                          neurons are regrouped around initialized router rows
         ema               EMA z-norm + softmax (proposed) — no aux loss, no z-loss
         ema_trend         as `ema`, plus undamped Holt's linear-trend smoothing on MEAN —
                           zero steady-state lag for linear μ drift; variance stays plain EMA
@@ -135,6 +138,7 @@ DATA_PATHS = [
 class RoutingVariant(StrEnum):
     baseline = "baseline"
     deepseek = "deepseek"
+    deepseek_router_centroid_init = "deepseek_router_centroid_init"
     ema = "ema"
     ema_trend = "ema_trend"
     ema_trend_damped = "ema_trend_damped"
@@ -160,7 +164,10 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         # (lb=0.01) AND router z-loss (z=0.001). The classic OLMoE / Mixtral recipe.
         return
 
-    if variant == RoutingVariant.deepseek:
+    if variant in (
+        RoutingVariant.deepseek,
+        RoutingVariant.deepseek_router_centroid_init,
+    ):
         # arXiv:2408.15664 (§4) — strict "Auxiliary-Loss-Free Load Balancing":
         # sigmoid → bias-shifted top-k → unbiased gather → L1 renorm → bias update
         # by sign(ideal − actual). γ=u=1e-3 per §4.3 ("Update rate"). NO standard
@@ -172,6 +179,9 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.router.normalize_expert_weights = 1.0
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
+        moe.reorganize_expert_init_by_router = (
+            variant == RoutingVariant.deepseek_router_centroid_init
+        )
         return
 
     if variant == RoutingVariant.deepseek_v3:

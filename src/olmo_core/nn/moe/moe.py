@@ -72,6 +72,12 @@ class MoEConfig(ModuleConfig):
     )
     z_loss_weight: Optional[float] = None
     scale_loss_by_num_layers: bool = True
+    reorganize_expert_init_by_router: bool = False
+    """
+    After standard initialization, reorganize the initialized expert neurons
+    into balanced clusters whose fixed centroids are the initialized router
+    rows. Weight values are only permuted, never modified.
+    """
     dtype: DType = DType.float32
 
     def num_params(self, d_model: int) -> int:
@@ -139,11 +145,13 @@ class MoEBase(nn.Module):
         z_loss_weight: Optional[float] = None,
         n_layers: int = 1,
         scale_loss_by_num_layers: bool = True,
+        reorganize_expert_init_by_router: bool = False,
         dtype: torch.dtype = torch.float32,
         cache: Optional[BufferCache] = None,
         **kwargs,
     ):
         super().__init__()
+        self.reorganize_expert_init_by_router = reorganize_expert_init_by_router
         if scale_loss_by_num_layers:
             if lb_loss_weight is not None:
                 lb_loss_weight = lb_loss_weight / n_layers
@@ -358,6 +366,7 @@ class MoE(MoEBase):
         z_loss_weight: Optional[float] = None,
         scale_loss_by_num_layers: bool = True,
         n_layers: int = 1,
+        reorganize_expert_init_by_router: bool = False,
         dtype: torch.dtype = torch.float32,
         cache: Optional[BufferCache] = None,
     ):
@@ -373,6 +382,7 @@ class MoE(MoEBase):
             z_loss_weight=z_loss_weight,
             scale_loss_by_num_layers=scale_loss_by_num_layers,
             n_layers=n_layers,
+            reorganize_expert_init_by_router=reorganize_expert_init_by_router,
             dtype=dtype,
             capacity_factor=capacity_factor,
             cache=cache,
