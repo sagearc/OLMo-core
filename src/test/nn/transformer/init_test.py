@@ -13,14 +13,18 @@ from olmo_core.nn.attention.recurrent import GatedDeltaNetConfig
 from olmo_core.nn.feed_forward import FeedForwardConfig
 from olmo_core.nn.layer_norm import LayerNormConfig, LayerNormType
 from olmo_core.nn.lm_head import LMHeadConfig
-from olmo_core.nn.moe import MoEConfig
+from olmo_core.nn.moe import MoEConfig, MoEType
 from olmo_core.nn.transformer import (
     TransformerBlockConfig,
     TransformerBlockType,
     TransformerConfig,
     TransformerType,
 )
-from olmo_core.nn.transformer.init import InitMethod
+from olmo_core.nn.transformer.init import (
+    InitMethod,
+    _balanced_fixed_centroid_assignment,
+    _reorganize_expert_neurons_by_router_,
+)
 
 
 @pytest.mark.parametrize("d_model", [256, 512])
@@ -196,6 +200,54 @@ def test_fan_in_init_raises_for_gdn():
     model = config.build(init_device="cpu")
     with pytest.raises(NotImplementedError, match="fan_in.*not supported.*GatedDeltaNet"):
         model.init_weights(device=torch.device("cpu"))
+
+
+def test_balanced_fixed_centroid_assignment_enforces_capacity():
+    scores = torch.tensor(
+        [
+            [9.0, 3.0, 2.0],
+            [8.0, 2.0, 1.0],
+            [7.0, 6.0, 1.0],
+            [6.0, 5.0, 4.0],
+            [5.0, 4.0, 3.0],
+            [4.0, 3.0, 2.0],
+        ]
+    )
+
+    assignment = _balanced_fixed_centroid_assignment(scores, rows_per_expert=2)
+
+    assert assignment.shape == (6,)
+    assert torch.equal(assignment.bincount(minlength=3), torch.tensor([2, 2, 2]))
+
+
+def test_router_centroid_init_is_balanced_triplet_permutation():
+    moe = MoEConfig(
+        name=MoEType.dropless,
+        num_experts=2,
+        hidden_size=2,
+    ).build(d_model=2)
+    mlp = moe.experts.mlp
+
+    with torch.no_grad():
+        moe.router.weight.copy_(
+            torch.tensor([[1.0, 0.0], [0.0, 1.0]]).flatten()
+        )
+        # The initial expert ownership is intentionally opposite the router
+        # alignment, so the expected balanced permutation is unambiguous.
+        mlp.w1.copy_(torch.tensor([[0.0, 1.0], [0.0, 1.0], [1.0, 0.0], [1.0, 0.0]]))
+        mlp.w3.copy_(mlp.w1)
+        mlp.w2.copy_(torch.tensor([[10.0, 11.0], [20.0, 21.0], [30.0, 31.0], [40.0, 41.0]]))
+
+    diagnostics = _reorganize_expert_neurons_by_router_(moe, block_idx=0)
+
+    expected_w1 = torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]])
+    expected_w2 = torch.tensor([[30.0, 31.0], [40.0, 41.0], [10.0, 11.0], [20.0, 21.0]])
+    assert torch.equal(mlp.w1, expected_w1)
+    assert torch.equal(mlp.w3, expected_w1)
+    assert torch.equal(mlp.w2, expected_w2)
+    assert diagnostics["min_cluster_size"] == 2
+    assert diagnostics["max_cluster_size"] == 2
+    assert diagnostics["score_after"] > diagnostics["score_before"]
 
 
 if __name__ == "__main__":
