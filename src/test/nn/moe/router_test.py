@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from olmo_core.nn.moe.router import MoELinearRouter, MoERouterGatingFunction
+from olmo_core.nn.moe.router import (
+    MoEHalfLeaveOneOutLinearRouter,
+    MoELinearRouter,
+    MoERouterGatingFunction,
+)
 from olmo_core.testing import DEVICES
 
 
@@ -82,6 +86,66 @@ def test_router_with_bias_gamma(device: torch.device):
     assert router1.score_bias.nonzero().sum().item() > 0  # type: ignore
     assert router1.score_bias_batch_size_per_expert is not None
     assert router1.score_bias_batch_size_per_expert.nonzero().sum().item() == 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_half_leave_one_out_matches_forward_and_routes_gradients(
+    device: torch.device,
+):
+    common = {
+        "d_model": 4,
+        "num_experts": 8,
+        "top_k": 4,
+        "gating_function": MoERouterGatingFunction.sigmoid,
+        "normalize_expert_weights": 1.0,
+        "bias_gamma": 1e-3,
+    }
+    baseline = MoELinearRouter(**common).to(device)
+    leave_one_out = MoEHalfLeaveOneOutLinearRouter(**common).to(device)
+    with torch.no_grad():
+        weight = torch.zeros((8, 4), device=device)
+        weight[:, 0] = torch.arange(8, device=device)
+        baseline.weight.copy_(weight.flatten())
+        leave_one_out.weight.copy_(weight.flatten())
+
+    x = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]], device=device)
+    baseline_weights, baseline_indices, baseline_load, _ = baseline(x)
+    loo_weights, loo_indices, loo_load, _ = leave_one_out(x)
+
+    torch.testing.assert_close(loo_weights, baseline_weights)
+    torch.testing.assert_close(loo_indices, baseline_indices)
+    torch.testing.assert_close(loo_load, baseline_load)
+    assert loo_indices.tolist() == [[[7, 6, 5, 4]]]
+
+    coefficients = torch.tensor([[[2.0, -1.0, 0.5, 3.0]]], device=device)
+    (baseline_weights * coefficients).sum().backward()
+    (loo_weights * coefficients).sum().backward()
+    assert baseline.weight.grad is not None
+    assert leave_one_out.weight.grad is not None
+    baseline_per_row = baseline.weight.grad.view(8, 4).abs().sum(dim=-1)
+    loo_per_row = leave_one_out.weight.grad.view(8, 4).abs().sum(dim=-1)
+
+    torch.testing.assert_close(baseline_per_row[:4], torch.zeros_like(baseline_per_row[:4]))
+    assert torch.all(baseline_per_row[4:] > 0)
+    assert torch.all(loo_per_row[:4] > 0)
+    torch.testing.assert_close(loo_per_row[4:], torch.zeros_like(loo_per_row[4:]))
+
+
+def test_half_leave_one_out_rejects_non_half_or_coupled_gating():
+    with pytest.raises(Exception, match="top_k == num_experts / 2"):
+        MoEHalfLeaveOneOutLinearRouter(
+            d_model=8,
+            num_experts=8,
+            top_k=3,
+            gating_function=MoERouterGatingFunction.sigmoid,
+        )
+    with pytest.raises(Exception, match="independent sigmoid"):
+        MoEHalfLeaveOneOutLinearRouter(
+            d_model=8,
+            num_experts=8,
+            top_k=4,
+            gating_function=MoERouterGatingFunction.softmax,
+        )
 
 
 @pytest.mark.parametrize("device", DEVICES)

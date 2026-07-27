@@ -61,9 +61,9 @@ class _UniformExpertAssignment(torch.autograd.Function):
         return out.view(x.shape)
 
 
-_uniform_expert_assignment: Callable[
-    [torch.Tensor, int], torch.Tensor
-] = _UniformExpertAssignment.apply  # type: ignore
+_uniform_expert_assignment: Callable[[torch.Tensor, int], torch.Tensor] = (
+    _UniformExpertAssignment.apply
+)  # type: ignore
 
 
 class MoERouterType(StrEnum):
@@ -74,6 +74,11 @@ class MoERouterType(StrEnum):
     default = "default"
     """
     ➡️ :class:`MoELinearRouter`
+    """
+
+    half_leave_one_out = "half_leave_one_out"
+    """
+    ➡️ :class:`MoEHalfLeaveOneOutLinearRouter`
     """
 
     centroid = "centroid"
@@ -243,7 +248,7 @@ class MoERouterConfig(ModuleConfig):
         :param d_model: The model dimensionality.
         """
         num_params = 0
-        if self.name == MoERouterType.default:
+        if self.name in (MoERouterType.default, MoERouterType.half_leave_one_out):
             num_params += d_model * num_experts
         elif self.name != MoERouterType.centroid:
             raise NotImplementedError
@@ -279,7 +284,7 @@ class MoERouterConfig(ModuleConfig):
             z_loss_weight=z_loss_weight,
         )
         try:
-            if self.name == MoERouterType.default:
+            if self.name in (MoERouterType.default, MoERouterType.half_leave_one_out):
                 kwargs.pop("centroid_alpha", None)
                 kwargs.pop("centroid_lr_lambda", None)
                 kwargs.pop("centroid_spherical", None)
@@ -288,6 +293,8 @@ class MoERouterConfig(ModuleConfig):
                     kwargs["dtype"] = self.dtype.as_pt()
                 elif dtype is not None:
                     kwargs["dtype"] = dtype
+                if self.name == MoERouterType.half_leave_one_out:
+                    return MoEHalfLeaveOneOutLinearRouter(**kwargs)
                 return MoELinearRouter(**kwargs)
             elif self.name == MoERouterType.centroid:
                 return MoECentroidRouter(**kwargs)
@@ -363,15 +370,15 @@ class MoERouter(nn.Module):
                 "ema_zscore_trend requires ema_zscore_normalize=True; it's a modifier "
                 "on the EMA path, not a standalone mode."
             )
-            assert (
-                0.0 < ema_zscore_trend_beta < 1.0
-            ), f"ema_zscore_trend_beta must be in (0, 1), got {ema_zscore_trend_beta}."
-            assert (
-                ema_zscore_trend_warmup >= 0
-            ), f"ema_zscore_trend_warmup must be >= 0, got {ema_zscore_trend_warmup}."
-            assert (
-                0.0 < ema_zscore_trend_damping <= 1.0
-            ), f"ema_zscore_trend_damping must be in (0, 1], got {ema_zscore_trend_damping}."
+            assert 0.0 < ema_zscore_trend_beta < 1.0, (
+                f"ema_zscore_trend_beta must be in (0, 1), got {ema_zscore_trend_beta}."
+            )
+            assert ema_zscore_trend_warmup >= 0, (
+                f"ema_zscore_trend_warmup must be >= 0, got {ema_zscore_trend_warmup}."
+            )
+            assert 0.0 < ema_zscore_trend_damping <= 1.0, (
+                f"ema_zscore_trend_damping must be in (0, 1], got {ema_zscore_trend_damping}."
+            )
         self.ema_zscore_trend_beta = ema_zscore_trend_beta
         self.ema_zscore_trend_warmup = ema_zscore_trend_warmup
         self.ema_zscore_trend_damping = ema_zscore_trend_damping
@@ -661,8 +668,7 @@ class MoERouter(nn.Module):
                 # step (seamless switch). Trend applies to the MEAN only; variance
                 # is always plain EMA.
                 use_trend = (
-                    self.ema_zscore_trend
-                    and self._ema_step_py >= self.ema_zscore_trend_warmup
+                    self.ema_zscore_trend and self._ema_step_py >= self.ema_zscore_trend_warmup
                 )
                 if use_trend:
                     assert self._ema_mean_trend is not None
@@ -862,7 +868,9 @@ class MoERouter(nn.Module):
             assert self.score_bias is not None
             with torch.no_grad():
                 _, expert_indices = torch.topk(
-                    scores + self.score_bias.unsqueeze(0), self.top_k, dim=-1  # type: ignore
+                    scores + self.score_bias.unsqueeze(0),
+                    self.top_k,
+                    dim=-1,  # type: ignore
                 )
             expert_weights = scores.gather(-1, expert_indices)
 
@@ -1144,12 +1152,66 @@ class MoELinearRouter(MoERouter):
     ) -> Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]]:
         from olmo_core.train.common import ReduceType
 
+        def geometry_metrics(
+            rows: torch.Tensor, prefix: str
+        ) -> Dict[str, Tuple[torch.Tensor, Optional["ReduceType"]]]:
+            rows = rows.view(self.num_experts, self.d_model).float()
+            mean_row = rows.mean(dim=0, keepdim=True)
+            centered = rows - mean_row
+            total_energy = rows.square().sum()
+            centered_energy = centered.square().sum()
+            tiny = torch.finfo(rows.dtype).tiny
+            common_energy_fraction = (
+                self.num_experts * mean_row.square().sum()
+            ) / total_energy.clamp_min(tiny)
+
+            singular_energy = torch.linalg.svdvals(centered).square()
+            singular_probability = singular_energy / singular_energy.sum().clamp_min(tiny)
+            effective_rank = torch.where(
+                centered_energy > 0,
+                torch.exp(
+                    -(singular_probability * singular_probability.clamp_min(tiny).log()).sum()
+                ),
+                torch.zeros_like(centered_energy),
+            )
+
+            eye = torch.eye(self.num_experts, dtype=torch.bool, device=rows.device)
+            raw_cosine = F.normalize(rows, dim=-1) @ F.normalize(rows, dim=-1).T
+            centered_cosine = F.normalize(centered, dim=-1) @ F.normalize(centered, dim=-1).T
+            return {
+                f"{prefix} common energy fraction": (
+                    common_energy_fraction,
+                    ReduceType.mean,
+                ),
+                f"{prefix} centered effective rank": (
+                    effective_rank,
+                    ReduceType.mean,
+                ),
+                f"{prefix} raw abs cosine": (
+                    raw_cosine.masked_select(~eye).abs().mean(),
+                    ReduceType.mean,
+                ),
+                f"{prefix} centered abs cosine": (
+                    centered_cosine.masked_select(~eye).abs().mean(),
+                    ReduceType.mean,
+                ),
+            }
+
         # `.grad` is populated between backward and optim.step — see
         # `TransformerTrainModule.train_batch`. Useful for detecting router weight runaway
         # under ema-zscore feedback loops.
         out = super().compute_metrics(reset=False)
+        full_weight = get_full_tensor(self.weight.detach()).float()
+        out.update(geometry_metrics(full_weight, "weight geometry"))
+        per_expert_weight_norm = full_weight.view(self.num_experts, self.d_model).norm(dim=1)
+        for i in range(per_expert_weight_norm.shape[0]):
+            out[f"expert {i:02d}/weight norm"] = (
+                per_expert_weight_norm[i],
+                ReduceType.mean,
+            )
         if self.weight.grad is not None:
             full_grad = get_full_tensor(self.weight.grad.detach()).float()
+            out.update(geometry_metrics(full_grad, "gradient geometry"))
             per_expert_grad_norm = full_grad.view(self.num_experts, self.d_model).norm(dim=1)
             for i in range(per_expert_grad_norm.shape[0]):
                 out[f"expert {i:02d}/weight grad norm"] = (
@@ -1164,6 +1226,52 @@ class MoELinearRouter(MoERouter):
         super().apply_tp(tp_mesh, float8_enabled=float8_enabled)
         self.register_parameter(
             "weight", nn.Parameter(distribute_tensor(self.weight, tp_mesh, [Replicate()]))
+        )
+
+
+class MoEHalfLeaveOneOutLinearRouter(MoELinearRouter):
+    """
+    Forward-matched half-selected / half-leave-one-out router.
+
+    This router requires exactly half of the experts to be selected. Its forward
+    pass is identical to the ordinary router. In the backward pass all selected
+    scores are detached and replaced by the negative mean score of the unselected
+    half. Adding a constant such as ``1 - mean(...)`` would produce exactly the
+    same gradient and therefore would not change the intervention.
+
+    The no-selected-row-gradient invariant requires independent per-expert gates.
+    This implementation consequently supports sigmoid gating only; a full
+    softmax would couple every score through its denominator.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.num_experts % 2 != 0 or self.top_k != self.num_experts // 2:
+            raise OLMoConfigurationError(
+                "half leave-one-out routing requires an even number of experts "
+                "and top_k == num_experts / 2."
+            )
+        if self.gating_function != MoERouterGatingFunction.sigmoid:
+            raise OLMoConfigurationError(
+                "half leave-one-out routing requires independent sigmoid scores; "
+                "full softmax scores would leak gradient into selected rows."
+            )
+
+    def get_top_k(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        expert_weights, expert_indices = super().get_top_k(scores)
+
+        selected = torch.zeros_like(scores, dtype=torch.bool)
+        selected.scatter_(-1, expert_indices, True)
+        complement_mean = scores.masked_fill(selected, 0.0).sum(dim=-1, keepdim=True) / (
+            self.num_experts - self.top_k
+        )
+        backward_weights = (-complement_mean).expand_as(expert_weights)
+
+        # Forward values and assignments exactly match the ordinary router.
+        # Only the autograd dependency is replaced.
+        return (
+            expert_weights.detach() + (backward_weights - backward_weights.detach()),
+            expert_indices,
         )
 
 
@@ -1230,8 +1338,10 @@ class MoECentroidRouter(MoERouter):
 
         # Random unit vectors — shape (K*C, d_model).
         centroid_init = torch.randn(
-            self.num_experts * num_centroids_per_expert, self.d_model,
-            dtype=torch.float32, device=init_device,
+            self.num_experts * num_centroids_per_expert,
+            self.d_model,
+            dtype=torch.float32,
+            device=init_device,
         )
         F.normalize(centroid_init, dim=-1, out=centroid_init)
         self.register_buffer("_centroid", centroid_init)
