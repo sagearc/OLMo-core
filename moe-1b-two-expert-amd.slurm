@@ -22,6 +22,7 @@ set -uo pipefail
 : "${MICROBATCH_SEQUENCES:=64}"
 : "${GLOBAL_BATCH_SEQUENCES:=1152}"
 : "${SMOKE_STEPS:=0}"
+: "${BIAS_GAMMA:=0.001}"
 
 case "${ROUTING}" in
     deepseek|deepseek_binary_leave_one_out) ;;
@@ -124,6 +125,7 @@ echo "architecture=d1024-l9-h8-experts2-top1"
 echo "microbatch_sequences=${MICROBATCH_SEQUENCES}"
 echo "global_batch_sequences=${GLOBAL_BATCH_SEQUENCES}"
 echo "gradient_accumulation_steps=$((GLOBAL_BATCH_SEQUENCES / MICROBATCH_SEQUENCES))"
+echo "bias_gamma=${BIAS_GAMMA}"
 sha256sum \
     "${LOCAL_SRC}/olmo_core/nn/moe/router.py" \
     "${LOCAL_SRC}/scripts/train/moe-1b.py"
@@ -152,6 +154,7 @@ args=(
     "--model.block.feed_forward_moe.num_experts=2"
     "--model.block.feed_forward_moe.router.top_k=1"
     "--model.block.feed_forward_moe.router.normalize_expert_weights=null"
+    "--model.block.feed_forward_moe.router.bias_gamma=${BIAS_GAMMA}"
     "--dataset.paths=[${LOCAL_DATA}]"
     "--dataset.work_dir=${LOCAL_ROOT}/dataset-cache"
     "--data_loader.global_batch_size=${GLOBAL_BATCH_SIZE}"
