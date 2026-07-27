@@ -19,10 +19,11 @@ set -uo pipefail
 : "${SOURCE_DIR:?Set SOURCE_DIR to the immutable source snapshot}"
 : "${ROUTING:?Set ROUTING to deepseek or deepseek_binary_leave_one_out}"
 : "${RUN_TAG:?Set the shared stable run tag}"
-: "${MICROBATCH_SEQUENCES:=64}"
+: "${MICROBATCH_SEQUENCES:=96}"
 : "${GLOBAL_BATCH_SEQUENCES:=1152}"
 : "${SMOKE_STEPS:=0}"
 : "${BIAS_GAMMA:=0.001}"
+: "${COMPILE_MODEL:=true}"
 
 case "${ROUTING}" in
     deepseek|deepseek_binary_leave_one_out) ;;
@@ -126,6 +127,7 @@ echo "microbatch_sequences=${MICROBATCH_SEQUENCES}"
 echo "global_batch_sequences=${GLOBAL_BATCH_SEQUENCES}"
 echo "gradient_accumulation_steps=$((GLOBAL_BATCH_SEQUENCES / MICROBATCH_SEQUENCES))"
 echo "bias_gamma=${BIAS_GAMMA}"
+echo "compile_model=${COMPILE_MODEL}"
 sha256sum \
     "${LOCAL_SRC}/olmo_core/nn/moe/router.py" \
     "${LOCAL_SRC}/scripts/train/moe-1b.py"
@@ -172,7 +174,7 @@ args=(
     "--data_loader.global_batch_size=${GLOBAL_BATCH_SIZE}"
     "--data_loader.num_workers=0"
     "--train_module.rank_microbatch_size=${RANK_MICROBATCH_SIZE}"
-    "--train_module.compile_model=false"
+    "--train_module.compile_model=${COMPILE_MODEL}"
     "--trainer.save_folder=${LOCAL_RUN_DIR}"
     "--trainer.metrics_collect_interval=10"
     "--trainer.callbacks.wandb.group=moe1b-two-expert-forward-loo"
