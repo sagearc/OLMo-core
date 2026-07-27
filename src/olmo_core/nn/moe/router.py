@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from olmo_core.train.common import ReduceType
 
 __all__ = [
+    "MoEBinaryLeaveOneOutLinearRouter",
     "MoERouter",
     "MoELinearRouter",
     "MoERouterConfig",
@@ -74,6 +75,11 @@ class MoERouterType(StrEnum):
     default = "default"
     """
     ➡️ :class:`MoELinearRouter`
+    """
+
+    binary_leave_one_out = "binary_leave_one_out"
+    """
+    ➡️ :class:`MoEBinaryLeaveOneOutLinearRouter`
     """
 
     half_leave_one_out = "half_leave_one_out"
@@ -248,7 +254,11 @@ class MoERouterConfig(ModuleConfig):
         :param d_model: The model dimensionality.
         """
         num_params = 0
-        if self.name in (MoERouterType.default, MoERouterType.half_leave_one_out):
+        if self.name in (
+            MoERouterType.default,
+            MoERouterType.binary_leave_one_out,
+            MoERouterType.half_leave_one_out,
+        ):
             num_params += d_model * num_experts
         elif self.name != MoERouterType.centroid:
             raise NotImplementedError
@@ -284,7 +294,11 @@ class MoERouterConfig(ModuleConfig):
             z_loss_weight=z_loss_weight,
         )
         try:
-            if self.name in (MoERouterType.default, MoERouterType.half_leave_one_out):
+            if self.name in (
+                MoERouterType.default,
+                MoERouterType.binary_leave_one_out,
+                MoERouterType.half_leave_one_out,
+            ):
                 kwargs.pop("centroid_alpha", None)
                 kwargs.pop("centroid_lr_lambda", None)
                 kwargs.pop("centroid_spherical", None)
@@ -293,6 +307,8 @@ class MoERouterConfig(ModuleConfig):
                     kwargs["dtype"] = self.dtype.as_pt()
                 elif dtype is not None:
                     kwargs["dtype"] = dtype
+                if self.name == MoERouterType.binary_leave_one_out:
+                    return MoEBinaryLeaveOneOutLinearRouter(**kwargs)
                 if self.name == MoERouterType.half_leave_one_out:
                     return MoEHalfLeaveOneOutLinearRouter(**kwargs)
                 return MoELinearRouter(**kwargs)
@@ -1227,6 +1243,33 @@ class MoELinearRouter(MoERouter):
         self.register_parameter(
             "weight", nn.Parameter(distribute_tensor(self.weight, tp_mesh, [Replicate()]))
         )
+
+
+class MoEBinaryLeaveOneOutLinearRouter(MoELinearRouter):
+    """
+    Two-expert top-1 router with forward scores
+    ``(1 - sigmoid(z_1), 1 - sigmoid(z_0))``.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if self.num_experts != 2 or self.top_k != 1:
+            raise OLMoConfigurationError(
+                "binary leave-one-out routing requires 2 experts and top_k=1."
+            )
+        if self.gating_function != MoERouterGatingFunction.sigmoid:
+            raise OLMoConfigurationError(
+                "binary leave-one-out routing requires sigmoid scores."
+            )
+        if self.normalize_expert_weights is not None:
+            raise OLMoConfigurationError(
+                "binary leave-one-out routing requires no top-1 weight normalization."
+            )
+
+    def get_top_k(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # `scores` includes the ordinary router's 1e-7 numerical floor.
+        leave_one_out_scores = 1.0 - (scores - 1e-7).flip(dims=(-1,)) + 1e-7
+        return MoERouter.get_top_k(self, leave_one_out_scores)
 
 
 class MoEHalfLeaveOneOutLinearRouter(MoELinearRouter):

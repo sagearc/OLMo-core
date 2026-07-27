@@ -24,6 +24,9 @@ Usage:
     where VARIANT is one of:
         baseline          softmax + Switch lb_loss (0.01) + router z-loss (0.001) — floor
         deepseek          sigmoid + bias rule (γ=1e-3) — strict arXiv:2408.15664, no aux loss
+        deepseek_binary_leave_one_out
+                          two-expert/top-1 score for candidate i is one minus the
+                          other expert's sigmoid score
         ema               EMA z-norm + softmax (proposed) — no aux loss, no z-loss
         ema_trend         as `ema`, plus undamped Holt's linear-trend smoothing on MEAN —
                           zero steady-state lag for linear μ drift; variance stays plain EMA
@@ -135,6 +138,7 @@ DATA_PATHS = [
 class RoutingVariant(StrEnum):
     baseline = "baseline"
     deepseek = "deepseek"
+    deepseek_binary_leave_one_out = "deepseek_binary_leave_one_out"
     ema = "ema"
     ema_trend = "ema_trend"
     ema_trend_damped = "ema_trend_damped"
@@ -170,6 +174,15 @@ def configure_routing(moe: MoEConfig, variant: RoutingVariant) -> None:
         moe.router.gating_function = MoERouterGatingFunction.sigmoid
         moe.router.bias_gamma = 1e-3
         moe.router.normalize_expert_weights = 1.0
+        moe.lb_loss_weight = None
+        moe.z_loss_weight = None
+        return
+
+    if variant == RoutingVariant.deepseek_binary_leave_one_out:
+        moe.router.name = MoERouterType.binary_leave_one_out
+        moe.router.gating_function = MoERouterGatingFunction.sigmoid
+        moe.router.bias_gamma = 1e-3
+        moe.router.normalize_expert_weights = None
         moe.lb_loss_weight = None
         moe.z_loss_weight = None
         return
