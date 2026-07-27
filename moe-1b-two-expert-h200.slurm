@@ -19,7 +19,6 @@ set -euo pipefail
 : "${ROUTING:?Set ROUTING to deepseek or deepseek_binary_leave_one_out}"
 : "${RUN_TAG:?Set the stable tag shared by the pair}"
 : "${SOURCE_DIR:?Set SOURCE_DIR to the immutable source snapshot}"
-: "${WANDB_API_KEY:?WANDB_API_KEY is required}"
 : "${MICROBATCH_SEQUENCES:=32}"
 : "${GLOBAL_BATCH_SEQUENCES:=1152}"
 
