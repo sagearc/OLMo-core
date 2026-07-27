@@ -116,6 +116,11 @@ def test_half_leave_one_out_matches_forward_and_routes_gradients(
     torch.testing.assert_close(loo_indices, baseline_indices)
     torch.testing.assert_close(loo_load, baseline_load)
     assert loo_indices.tolist() == [[[7, 6, 5, 4]]]
+    assert torch.all(loo_weights > 0)
+    torch.testing.assert_close(
+        loo_weights.sum(dim=-1),
+        torch.ones_like(loo_weights[..., 0]),
+    )
 
     coefficients = torch.tensor([[[2.0, -1.0, 0.5, 3.0]]], device=device)
     (baseline_weights * coefficients).sum().backward()
@@ -129,6 +134,28 @@ def test_half_leave_one_out_matches_forward_and_routes_gradients(
     assert torch.all(baseline_per_row[4:] > 0)
     assert torch.all(loo_per_row[:4] > 0)
     torch.testing.assert_close(loo_per_row[4:], torch.zeros_like(loo_per_row[4:]))
+
+
+def test_half_leave_one_out_rank_pairs_backward_scores():
+    router = MoEHalfLeaveOneOutLinearRouter(
+        d_model=1,
+        num_experts=8,
+        top_k=4,
+        gating_function=MoERouterGatingFunction.sigmoid,
+    )
+    scores = (torch.arange(1, 9, dtype=torch.float32).view(1, 1, 8) / 10).requires_grad_()
+    selected_scores, selected_indices = router.get_top_k(scores)
+    assert selected_indices.tolist() == [[[7, 6, 5, 4]]]
+
+    coefficients = torch.tensor([[[2.0, -1.0, 0.5, 3.0]]])
+    (selected_scores * coefficients).sum().backward()
+    assert scores.grad is not None
+    torch.testing.assert_close(
+        scores.grad,
+        torch.tensor([[[-2.0, 1.0, -0.5, -3.0, 0.0, 0.0, 0.0, 0.0]]]),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_half_leave_one_out_rejects_non_half_or_coupled_gating():

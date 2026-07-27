@@ -1231,13 +1231,14 @@ class MoELinearRouter(MoERouter):
 
 class MoEHalfLeaveOneOutLinearRouter(MoELinearRouter):
     """
-    Forward-matched half-selected / half-leave-one-out router.
+    Forward-matched half-selected / complementary-gradient router.
 
     This router requires exactly half of the experts to be selected. Its forward
-    pass is identical to the ordinary router. In the backward pass all selected
-    scores are detached and replaced by the negative mean score of the unselected
-    half. Adding a constant such as ``1 - mean(...)`` would produce exactly the
-    same gradient and therefore would not change the intervention.
+    pass is identical to the ordinary router. For the backward pass, the selected
+    scores are rank-paired with the complementary half: best selected with worst
+    unselected, second-best selected with second-worst unselected, and so on.
+    Each selected forward path differentiates through ``1 - s`` for its paired
+    unselected expert.
 
     The no-selected-row-gradient invariant requires independent per-expert gates.
     This implementation consequently supports sigmoid gating only; a full
@@ -1262,10 +1263,20 @@ class MoEHalfLeaveOneOutLinearRouter(MoELinearRouter):
 
         selected = torch.zeros_like(scores, dtype=torch.bool)
         selected.scatter_(-1, expert_indices, True)
-        complement_mean = scores.masked_fill(selected, 0.0).sum(dim=-1, keepdim=True) / (
-            self.num_experts - self.top_k
-        )
-        backward_weights = (-complement_mean).expand_as(expert_weights)
+
+        if self._bias_enabled:
+            assert self.score_bias is not None
+            ranking_scores = scores + self.score_bias.unsqueeze(0)
+        else:
+            ranking_scores = scores
+        with torch.no_grad():
+            _, complement_indices = torch.topk(
+                ranking_scores.masked_fill(selected, torch.inf),
+                self.top_k,
+                dim=-1,
+                largest=False,
+            )
+        backward_weights = 1.0 - scores.gather(-1, complement_indices)
 
         # Forward values and assignments exactly match the ordinary router.
         # Only the autograd dependency is replaced.
