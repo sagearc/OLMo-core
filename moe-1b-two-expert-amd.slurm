@@ -144,12 +144,19 @@ replicate_checkpoints() {
         if [[ -s "${destination}/.metadata.json" ]]; then
             continue
         fi
-        temporary="${PERSISTENT_ROOT}/runs/.${checkpoint_name}.${SLURM_JOB_ID}.copying"
-        rm -rf "${temporary}"
-        rsync -a "$(dirname "${metadata}")/" "${temporary}/"
-        test -s "${temporary}/.metadata.json"
-        mv "${temporary}" "${destination}"
-        echo "replicated_checkpoint=${checkpoint_name}"
+        (
+            # Serialize large NFS writes from all runs on this node.
+            flock -x 9
+            if [[ -s "${destination}/.metadata.json" ]]; then
+                exit 0
+            fi
+            temporary="${PERSISTENT_ROOT}/runs/.${checkpoint_name}.${SLURM_JOB_ID}.copying"
+            mkdir -p "${temporary}"
+            rsync -a "$(dirname "${metadata}")/" "${temporary}/"
+            test -s "${temporary}/.metadata.json"
+            mv "${temporary}" "${destination}"
+            echo "replicated_checkpoint=${checkpoint_name}"
+        ) 9>/tmp/sagiahrac-moe1b-two-expert-checkpoint-copy.lock
     done
 }
 
