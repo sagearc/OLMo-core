@@ -135,6 +135,11 @@ replicate_checkpoints() {
     shopt -s nullglob
     for metadata in "${LOCAL_RUN_DIR}"/step*/.metadata.json; do
         checkpoint_name="$(basename "$(dirname "${metadata}")")"
+        # Step 0 is reproducible and copying four multi-GB optimizer checkpoints
+        # concurrently only adds avoidable NFS pressure.
+        if [[ "${checkpoint_name}" == "step0" ]]; then
+            continue
+        fi
         destination="${PERSISTENT_ROOT}/runs/${checkpoint_name}"
         if [[ -s "${destination}/.metadata.json" ]]; then
             continue
