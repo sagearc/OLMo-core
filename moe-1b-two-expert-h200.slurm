@@ -96,6 +96,23 @@ export WANDB_RESUME=allow
 export WANDB_ENTITY=MoEPaper
 export WANDB_PROJECT=MoE
 export WANDB_RUN_ID="${RUN_ID}"
+if [[ -z "${WANDB_API_KEY:-}" ]]; then
+    WANDB_API_KEY="$(
+        awk '
+            $1 == "machine" && $2 == "api.wandb.ai" { found = 1 }
+            found {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "password") {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }
+        ' "${HOME}/.netrc"
+    )"
+    export WANDB_API_KEY
+fi
+: "${WANDB_API_KEY:?No W&B credential found in the environment or netrc}"
 
 echo "host=$(hostname)"
 echo "routing=${ROUTING}"
