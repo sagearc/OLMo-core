@@ -97,6 +97,7 @@ export WANDB_ENTITY=MoEPaper
 export WANDB_PROJECT=MoE
 export WANDB_RUN_ID="${RUN_ID}"
 if [[ -z "${WANDB_API_KEY:-}" ]]; then
+    WANDB_NETRC="${WANDB_NETRC:-/home/morg/students/sagiahrac/.netrc}"
     WANDB_API_KEY="$(
         awk '
             $1 == "machine" && $2 == "api.wandb.ai" { found = 1 }
@@ -108,7 +109,7 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
                     }
                 }
             }
-        ' "${HOME}/.netrc"
+        ' "${WANDB_NETRC}"
     )"
     export WANDB_API_KEY
 fi
