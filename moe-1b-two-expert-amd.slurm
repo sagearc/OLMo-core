@@ -19,7 +19,7 @@ set -uo pipefail
 : "${SOURCE_DIR:?Set SOURCE_DIR to the immutable source snapshot}"
 : "${ROUTING:?Set ROUTING to deepseek or deepseek_binary_leave_one_out}"
 : "${RUN_TAG:?Set the shared stable run tag}"
-: "${MICROBATCH_SEQUENCES:=96}"
+: "${MICROBATCH_SEQUENCES:=64}"
 : "${GLOBAL_BATCH_SEQUENCES:=1152}"
 : "${SMOKE_STEPS:=0}"
 
@@ -45,9 +45,10 @@ NFS_DATA=/home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/wiki/part-0-
 LOCAL_PYTHON="${BASE_RUNTIME}/python/bin/python3.12"
 LOCAL_SITE="${BASE_RUNTIME}/site-packages"
 SOURCE_SITE="${SUBMIT_DIR}/.venv/lib/python3.12/site-packages"
-RUN_NAME="${RUN_TAG}-${ROUTING}"
-LOCAL_RUN_DIR="${LOCAL_ROOT}/runs/${RUN_NAME}"
-PERSISTENT_ROOT="/home/morg/students/sagiahrac/checkpoint-backups/moe1b-two-expert/${RUN_NAME}"
+RUN_NAME="${RUN_TAG}"
+RUN_ID="${RUN_TAG}-${ROUTING}"
+LOCAL_RUN_DIR="${LOCAL_ROOT}/runs/${RUN_ID}"
+PERSISTENT_ROOT="/home/morg/students/sagiahrac/checkpoint-backups/moe1b-two-expert/${RUN_ID}"
 RANK_MICROBATCH_SIZE=$((MICROBATCH_SEQUENCES * 2048))
 GLOBAL_BATCH_SIZE=$((GLOBAL_BATCH_SEQUENCES * 2048))
 
@@ -106,7 +107,9 @@ else
     : "${WANDB_API_KEY:?WANDB_API_KEY is required for the long run}"
     export WANDB_MODE=online
     export WANDB_RESUME=allow
-    export WANDB_RUN_ID="${RUN_NAME}"
+    export WANDB_ENTITY=MoEPaper
+    export WANDB_PROJECT=MoE
+    export WANDB_RUN_ID="${RUN_ID}"
 fi
 
 hard_stop_args=()
@@ -116,7 +119,7 @@ fi
 
 echo "host=$(hostname)"
 echo "routing=${ROUTING}"
-echo "run_name=${RUN_NAME}"
+echo "run_id=${RUN_ID}"
 echo "architecture=d1024-l9-h8-experts2-top1"
 echo "microbatch_sequences=${MICROBATCH_SEQUENCES}"
 echo "global_batch_sequences=${GLOBAL_BATCH_SEQUENCES}"
