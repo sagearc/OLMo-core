@@ -19,7 +19,7 @@ set -uo pipefail
 : "${SOURCE_DIR:?Set SOURCE_DIR to the immutable source snapshot}"
 : "${ROUTING:?Set ROUTING to deepseek or deepseek_binary_leave_one_out}"
 : "${RUN_TAG:?Set the shared stable run tag}"
-: "${MICROBATCH_SEQUENCES:=96}"
+: "${MICROBATCH_SEQUENCES:=192}"
 : "${GLOBAL_BATCH_SEQUENCES:=1152}"
 : "${SMOKE_STEPS:=0}"
 : "${BIAS_GAMMA:=0.001}"
