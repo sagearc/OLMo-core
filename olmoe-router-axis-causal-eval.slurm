@@ -24,6 +24,8 @@ PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${ACTIVE_REPO}/output/router-a
 DATASET_SPECS_FILE="${DATASET_SPECS_FILE:-${ACTIVE_REPO}/router-axis-validation-datasets.txt}"
 DATASET_ROOT="${DATASET_ROOT:-/home/morg/students/sagiahrac/dataset/olmoe-1pct/eval-data/perplexity/v3_small_gptneox20b}"
 CUDA_PYTHON="${CUDA_PYTHON:-${ACTIVE_REPO}/.venv-cuda/bin/python}"
+CANDIDATE_COUNT="${CANDIDATE_COUNT:-8}"
+POWER_ITERATIONS="${POWER_ITERATIONS:-12}"
 
 if [[ "$(git -C "${CLEAN_WORKTREE}" rev-parse HEAD)" != "${SOURCE_COMMIT}" ]]; then
   echo "clean worktree is not pinned to SOURCE_COMMIT" >&2
@@ -81,6 +83,8 @@ run_revision() {
     --sequence-length "${sequence_length}" \
     --calibration-sequences-per-label "${calibration_count}" \
     --eval-sequences-per-label "${eval_count}" \
+    --candidate-count "${CANDIDATE_COUNT}" \
+    --power-iterations "${POWER_ITERATIONS}" \
     "${dataset_args[@]}"
   if [[ "${HF_HOME}" == "${JOB_HF_ROOT}/"* ]]; then
     rm -rf "${HF_HOME}"
@@ -88,6 +92,21 @@ run_revision() {
 }
 
 case "${PHASE}" in
+  single)
+    REVISION="${REVISION:?set REVISION for PHASE=single}"
+    LAYERS="${LAYERS:-8}"
+    CONDITION_SET="${CONDITION_SET:-pilot}"
+    SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-512}"
+    CALIBRATION_COUNT="${CALIBRATION_COUNT:-4}"
+    EVAL_COUNT="${EVAL_COUNT:-16}"
+    run_revision \
+      "${REVISION}" \
+      "${LAYERS}" \
+      "${CONDITION_SET}" \
+      "${SEQUENCE_LENGTH}" \
+      "${CALIBRATION_COUNT}" \
+      "${EVAL_COUNT}"
+    ;;
   smoke)
     run_revision "step:5000" "8" "smoke" "256" "1" "1"
     ;;
