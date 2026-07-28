@@ -32,8 +32,9 @@ if [[ ! -x "${CUDA_PYTHON}" ]]; then
   echo "missing CUDA Python: ${CUDA_PYTHON}" >&2
   exit 1
 fi
-JOB_SOURCE="${SLURM_TMPDIR}/olmo-core-router-axis-${SLURM_JOB_ID}"
-JOB_HF_ROOT="${SLURM_TMPDIR}/router-axis-hf-${SLURM_JOB_ID}"
+JOB_LOCAL_ROOT="${SLURM_TMPDIR:-/tmp/${USER}/router-axis-eval-${SLURM_JOB_ID}}"
+JOB_SOURCE="${JOB_LOCAL_ROOT}/source"
+JOB_HF_ROOT="${JOB_LOCAL_ROOT}/hf"
 mkdir -p "${JOB_SOURCE}" "${JOB_HF_ROOT}" "${PERSISTENT_OUTPUT_ROOT}" logs
 cp -a "${CLEAN_WORKTREE}/." "${JOB_SOURCE}/"
 export PYTHONPATH="${JOB_SOURCE}/src"
