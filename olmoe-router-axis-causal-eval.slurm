@@ -35,7 +35,8 @@ if [[ ! -x "${CUDA_PYTHON}" ]]; then
 fi
 JOB_LOCAL_ROOT="${SLURM_TMPDIR:-/tmp/${USER}/router-axis-eval-${SLURM_JOB_ID}}"
 JOB_SOURCE="${JOB_LOCAL_ROOT}/source"
-JOB_HF_ROOT="${JOB_LOCAL_ROOT}/hf"
+# NODE_HF_ROOT may point at an isolated cache from a failed job on the same pinned node.
+JOB_HF_ROOT="${NODE_HF_ROOT:-${JOB_LOCAL_ROOT}/hf}"
 mkdir -p "${JOB_SOURCE}" "${JOB_HF_ROOT}" "${PERSISTENT_OUTPUT_ROOT}" logs
 cp -a "${CLEAN_WORKTREE}/." "${JOB_SOURCE}/"
 export PYTHONPATH="${JOB_SOURCE}/src"

@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -9,6 +10,7 @@ from scripts.olmoe_router_axis_causal_eval import (
     extract_fused_olmoe_expert_state,
     extract_olmoe_feed_forward_norm_state,
     implicit_orthogonal_eigendirections,
+    load_validation_token_array,
     quadratic_energy,
     repair_olmoe_gate_up_layout,
     torch_inference_gather,
@@ -146,6 +148,17 @@ def test_post_attention_norm_maps_to_native_feed_forward_norm():
 
     assert sorted(hf_state) == ["model.layers.2.input_layernorm.weight"]
     torch.testing.assert_close(converted["blocks.2.feed_forward_norm.weight"], post_attention)
+
+
+def test_validation_loader_reads_standard_npy_and_raw_olmo_uint16(tmp_path):
+    expected = np.array([7, 50303, 19, 0], dtype=np.uint16)
+    npy_path = tmp_path / "standard.npy"
+    raw_path = tmp_path / "olmo-raw.npy"
+    np.save(npy_path, expected)
+    expected.tofile(raw_path)
+
+    np.testing.assert_array_equal(load_validation_token_array(npy_path), expected)
+    np.testing.assert_array_equal(load_validation_token_array(raw_path), expected)
 
 
 def test_pure_torch_routing_permutation_matches_weighted_topk_sum():

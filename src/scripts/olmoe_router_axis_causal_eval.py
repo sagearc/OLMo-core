@@ -740,7 +740,7 @@ def numpy_validation_samples(
     for label, paths in sorted(by_label.items()):
         chunks: list[np.ndarray] = []
         for path in paths:
-            array = np.load(path, mmap_mode="r")
+            array = load_validation_token_array(path)
             flat = np.asarray(array).reshape(-1)
             usable = (flat.size // width) * width
             if usable:
@@ -769,6 +769,17 @@ def numpy_validation_samples(
                 )
             )
     return calibration, evaluation
+
+
+def load_validation_token_array(path: Path) -> np.ndarray:
+    """Memory-map either a standard ``.npy`` file or OLMo's raw uint16 token format."""
+    with path.open("rb") as file_handle:
+        is_npy = file_handle.read(6) == b"\x93NUMPY"
+    if is_npy:
+        return np.load(path, mmap_mode="r", allow_pickle=False)
+    if path.stat().st_size % np.dtype(np.uint16).itemsize:
+        raise RuntimeError(f"raw token file has invalid uint16 byte length: {path}")
+    return np.memmap(path, mode="r", dtype=np.uint16)
 
 
 def target_modules(
