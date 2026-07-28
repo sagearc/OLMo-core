@@ -6,6 +6,8 @@ from scripts.olmoe_router_axis_causal_eval import (
     GroupedProjectionHook,
     InterventionCondition,
     apply_grouped_projection,
+    extract_fused_olmoe_expert_state,
+    extract_olmoe_feed_forward_norm_state,
     implicit_orthogonal_eigendirections,
     quadratic_energy,
     repair_olmoe_gate_up_layout,
@@ -101,6 +103,49 @@ def test_hf_gate_up_layout_repair_is_per_expert_transpose():
 
     assert repaired == [key]
     torch.testing.assert_close(converted[key].view(2, 2, 3), expert_major.transpose(1, 2))
+
+
+def test_fused_hf_experts_map_exactly_to_native_w1_w2_w3():
+    # E=2, D=3, H=2. Fused gate/up is [E, 2H, D], down is [E, D, H].
+    prefix = "model.layers.4.mlp.experts"
+    gate = torch.arange(12).view(2, 2, 3)
+    up = 100 + torch.arange(12).view(2, 2, 3)
+    down = 200 + torch.arange(12).view(2, 3, 2)
+    hf_state = {
+        f"{prefix}.gate_up_proj": torch.cat((gate, up), dim=1),
+        f"{prefix}.down_proj": down,
+        "model.embed_tokens.weight": torch.empty(1),
+    }
+    native_prefix = "blocks.4.feed_forward_moe.experts.mlp"
+    native = {
+        f"{native_prefix}.w1": torch.empty(4, 3),
+        f"{native_prefix}.w2": torch.empty(4, 3),
+        f"{native_prefix}.w3": torch.empty(4, 3),
+    }
+
+    converted = extract_fused_olmoe_expert_state(hf_state, native)
+
+    assert sorted(hf_state) == ["model.embed_tokens.weight"]
+    torch.testing.assert_close(converted[f"{native_prefix}.w1"].view(2, 2, 3), gate)
+    torch.testing.assert_close(converted[f"{native_prefix}.w3"].view(2, 2, 3), up)
+    torch.testing.assert_close(
+        converted[f"{native_prefix}.w2"].view(2, 2, 3),
+        down.transpose(1, 2),
+    )
+
+
+def test_post_attention_norm_maps_to_native_feed_forward_norm():
+    post_attention = torch.arange(3, dtype=torch.float32)
+    hf_state = {
+        "model.layers.2.input_layernorm.weight": torch.full((3,), -1.0),
+        "model.layers.2.post_attention_layernorm.weight": post_attention,
+    }
+    native = {"blocks.2.feed_forward_norm.weight": torch.empty(3)}
+
+    converted = extract_olmoe_feed_forward_norm_state(hf_state, native)
+
+    assert sorted(hf_state) == ["model.layers.2.input_layernorm.weight"]
+    torch.testing.assert_close(converted["blocks.2.feed_forward_norm.weight"], post_attention)
 
 
 def test_pure_torch_routing_permutation_matches_weighted_topk_sum():

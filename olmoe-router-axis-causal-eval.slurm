@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=olmoe-router-axis-eval
-#SBATCH --partition=gpu-h200-killable
+#SBATCH --partition=gpu-morgeva
 #SBATCH --account=gpu-research
+#SBATCH --nodelist=t-100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -12,7 +13,7 @@
 #SBATCH --output=logs/router-axis-causal-%j.out
 #SBATCH --error=logs/router-axis-causal-%j.err
 
-# Use `sbatch --partition=gpu-b200-killable ...` only as a scheduler fallback.
+# Override partition/node at submission only when an explicit fallback is needed.
 set -euo pipefail
 
 ACTIVE_REPO="${ACTIVE_REPO:-/home/morg/students/sagiahrac/repos/olmo-core-repo}"

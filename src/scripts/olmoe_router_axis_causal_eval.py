@@ -35,11 +35,11 @@ import torch
 import torch.distributed.checkpoint.state_dict as dist_cp_sd
 import torch.nn.functional as F
 from huggingface_hub import list_repo_refs, snapshot_download
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from olmo_core.config import DType
 from olmo_core.eval.lm_evaluator import LMEvaluator
-from olmo_core.nn.hf.checkpoint import load_hf_model
+from olmo_core.nn.hf.convert import convert_state_from_hf
 from olmo_core.nn.moe.mlp import DroplessMoEMLP
 from olmo_core.nn.moe.router import MoELinearRouter
 from olmo_core.nn.transformer.config import TransformerBlockConfig, TransformerConfig
@@ -980,15 +980,127 @@ def load_native_model(
         cpu_offload=True,
     )
     state = dist_cp_sd.get_model_state_dict(model, options=options)
-    load_hf_model(snapshot, state, num_embeddings=hf_config.vocab_size)
-    repair_olmoe_gate_up_layout(state, model.state_dict())
+    hf_model = AutoModelForCausalLM.from_pretrained(snapshot)
+    hf_model.resize_token_embeddings(hf_config.vocab_size)
+    hf_state = dict(hf_model.state_dict())
+    fused_experts = extract_fused_olmoe_expert_state(hf_state, model.state_dict())
+    feed_forward_norms = extract_olmoe_feed_forward_norm_state(hf_state, model.state_dict())
+    converted_state = convert_state_from_hf(
+        hf_model.config,
+        hf_state,
+        model_type=getattr(hf_model.config, "model_type", None),
+    )
+    converted_state.update(fused_experts)
+    converted_state.update(feed_forward_norms)
+    repair_olmoe_gate_up_layout(converted_state, model.state_dict())
+    missing = sorted(set(state) - set(converted_state))
+    unexpected = sorted(set(converted_state) - set(state))
+    if missing or unexpected:
+        raise RuntimeError(f"native/HF state mismatch: missing={missing}, unexpected={unexpected}")
+    state.update(converted_state)
     model.load_state_dict(state, assign=True)
-    del state
+    del converted_state, feed_forward_norms, fused_experts, hf_state, hf_model, state
     gc.collect()
     model = model.to(device)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(snapshot)
     return model, tokenizer, snapshot
+
+
+def extract_olmoe_feed_forward_norm_state(
+    hf_state: dict[str, Any], native_state: Mapping[str, Any]
+) -> dict[str, torch.Tensor]:
+    """
+    Map OLMoE's post-attention norm to the native pre-MoE norm.
+
+    The generic upstream HF mapping aliases both ``input_layernorm`` and
+    ``post_attention_layernorm`` to ``attention_norm`` and otherwise leaves
+    native ``feed_forward_norm`` at random initialization.  Remove the latter
+    source key before generic conversion and map it explicitly here.
+    """
+    converted: dict[str, torch.Tensor] = {}
+    pattern = re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.weight$")
+    for hf_key in sorted(hf_state):
+        match = pattern.match(hf_key)
+        if match is None:
+            continue
+        layer = int(match.group(1))
+        value = hf_state.pop(hf_key)
+        native_key = f"blocks.{layer}.feed_forward_norm.weight"
+        target = native_state[native_key]
+        if (
+            not isinstance(value, torch.Tensor)
+            or not isinstance(target, torch.Tensor)
+            or value.shape != target.shape
+        ):
+            raise RuntimeError(
+                f"cannot map {hf_key} to {native_key}: "
+                f"value={getattr(value, 'shape', None)}, native={getattr(target, 'shape', None)}"
+            )
+        converted[native_key] = value
+    return converted
+
+
+def extract_fused_olmoe_expert_state(
+    hf_state: dict[str, Any], native_state: Mapping[str, Any]
+) -> dict[str, torch.Tensor]:
+    """
+    Convert the fused expert layout used by newer Transformers OLMoE modules.
+
+    Some public revisions load as ``gate_up_proj[E, 2H, D]`` and
+    ``down_proj[E, D, H]`` instead of per-expert Linear modules.  Remove only
+    those fused keys from the temporary HF state and return their exact native
+    OLMo-core W1/W2/W3 tensors.  The checkpoint and converter are untouched.
+    """
+    converted: dict[str, torch.Tensor] = {}
+    pattern = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj$")
+    for gate_key in sorted(hf_state):
+        match = pattern.match(gate_key)
+        if match is None:
+            continue
+        layer = int(match.group(1))
+        down_key = f"model.layers.{layer}.mlp.experts.down_proj"
+        if down_key not in hf_state:
+            raise RuntimeError(f"missing fused expert tensor {down_key}")
+        gate_up = hf_state.pop(gate_key)
+        down = hf_state.pop(down_key)
+        if not isinstance(gate_up, torch.Tensor) or not isinstance(down, torch.Tensor):
+            raise TypeError(f"fused expert states for layer {layer} must be tensors")
+        if gate_up.ndim != 3 or down.ndim != 3:
+            raise RuntimeError(
+                f"unexpected fused expert ranks at layer {layer}: "
+                f"gate/up={tuple(gate_up.shape)}, down={tuple(down.shape)}"
+            )
+        num_experts, twice_hidden, d_model = gate_up.shape
+        if twice_hidden % 2:
+            raise RuntimeError(f"odd fused gate/up hidden dimension at layer {layer}")
+        hidden_size = twice_hidden // 2
+        if down.shape != (num_experts, d_model, hidden_size):
+            raise RuntimeError(
+                f"incompatible fused down projection at layer {layer}: "
+                f"gate/up={tuple(gate_up.shape)}, down={tuple(down.shape)}"
+            )
+        gate, up = gate_up.split(hidden_size, dim=1)
+        prefix = f"blocks.{layer}.feed_forward_moe.experts.mlp"
+        native_values = {
+            f"{prefix}.w1": gate.contiguous(),
+            f"{prefix}.w2": down.transpose(1, 2).contiguous(),
+            f"{prefix}.w3": up.contiguous(),
+        }
+        for key, value in native_values.items():
+            target = native_state[key]
+            if not isinstance(target, torch.Tensor) or value.numel() != target.numel():
+                raise RuntimeError(
+                    f"cannot map fused {key}: value={tuple(value.shape)}, "
+                    f"native={getattr(target, 'shape', None)}"
+                )
+            converted[key] = value.view_as(target)
+    dangling = sorted(
+        key for key in hf_state if re.match(r"^model\.layers\.\d+\.mlp\.experts\.down_proj$", key)
+    )
+    if dangling:
+        raise RuntimeError(f"fused down projections without gate/up tensors: {dangling}")
+    return converted
 
 
 def repair_olmoe_gate_up_layout(
