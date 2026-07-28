@@ -19,6 +19,7 @@ SOURCE_COMMIT="${SOURCE_COMMIT:?set SOURCE_COMMIT to the exact pushed commit}"
 PHASE="${PHASE:-smoke}"
 PERSISTENT_OUTPUT_ROOT="${PERSISTENT_OUTPUT_ROOT:-${ACTIVE_REPO}/output/router-axis-causal-eval}"
 DATASET_SPECS_FILE="${DATASET_SPECS_FILE:-${ACTIVE_REPO}/router-axis-validation-datasets.txt}"
+DATASET_ROOT="${DATASET_ROOT:-/home/morg/students/sagiahrac/dataset/olmoe-1pct/eval-data/perplexity/v3_small_gptneox20b}"
 CUDA_PYTHON="${CUDA_PYTHON:-${ACTIVE_REPO}/.venv-cuda/bin/python}"
 
 if [[ "$(git -C "${CLEAN_WORKTREE}" rev-parse HEAD)" != "${SOURCE_COMMIT}" ]]; then
@@ -29,11 +30,6 @@ if [[ ! -x "${CUDA_PYTHON}" ]]; then
   echo "missing CUDA Python: ${CUDA_PYTHON}" >&2
   exit 1
 fi
-if [[ ! -r "${DATASET_SPECS_FILE}" ]]; then
-  echo "missing dataset specification file: ${DATASET_SPECS_FILE}" >&2
-  exit 1
-fi
-
 JOB_SOURCE="${SLURM_TMPDIR}/olmo-core-router-axis-${SLURM_JOB_ID}"
 JOB_HF_ROOT="${SLURM_TMPDIR}/router-axis-hf-${SLURM_JOB_ID}"
 mkdir -p "${JOB_SOURCE}" "${JOB_HF_ROOT}" "${PERSISTENT_OUTPUT_ROOT}" logs
@@ -43,10 +39,21 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 dataset_args=()
-while IFS= read -r spec; do
-  [[ -z "${spec}" || "${spec}" == \#* ]] && continue
-  dataset_args+=(--dataset-spec "${spec}")
-done < "${DATASET_SPECS_FILE}"
+if [[ -r "${DATASET_SPECS_FILE}" ]]; then
+  while IFS= read -r spec; do
+    [[ -z "${spec}" || "${spec}" == \#* ]] && continue
+    dataset_args+=(--dataset-spec "${spec}")
+  done < "${DATASET_SPECS_FILE}"
+else
+  while IFS= read -r path; do
+    label="$(basename "$(dirname "$(dirname "${path}")")")"
+    dataset_args+=(--dataset-spec "${label}=${path}")
+  done < <(find "${DATASET_ROOT}" -mindepth 3 -maxdepth 3 -type f -name '*.npy' | sort)
+fi
+if [[ "${#dataset_args[@]}" -eq 0 ]]; then
+  echo "no validation datasets resolved" >&2
+  exit 1
+fi
 
 driver="${JOB_SOURCE}/src/scripts/olmoe_router_axis_causal_eval.py"
 
