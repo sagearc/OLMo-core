@@ -1,0 +1,228 @@
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from olmo_core.nn.moe.mlp import DroplessMoEMLP
+from scripts.olmoe_router_axis_causal_eval import (
+    ControlBundle,
+    GroupedProjectionHook,
+    InterventionCondition,
+    add_layer_statistics,
+    apply_grouped_projection,
+    ce_validation_tolerances,
+    condition_set,
+    extract_fused_olmoe_expert_state,
+    extract_olmoe_feed_forward_norm_state,
+    implicit_orthogonal_eigendirections,
+    load_validation_token_array,
+    quadratic_energy,
+    repair_olmoe_gate_up_layout,
+    torch_inference_gather,
+    torch_inference_scatter,
+)
+
+
+def test_grouped_projection_is_expert_specific_and_exact():
+    x = torch.tensor(
+        [
+            [3.0, 4.0, 1.0],
+            [2.0, -1.0, 5.0],
+            [7.0, 2.0, -3.0],
+        ]
+    )
+    counts = torch.tensor([2, 1])
+    directions = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    identity, _ = apply_grouped_projection(x, counts, directions, alpha=0.0)
+    projected, diagnostics = apply_grouped_projection(x, counts, directions, alpha=1.0)
+
+    assert identity.data_ptr() == x.data_ptr()
+    torch.testing.assert_close(
+        projected,
+        torch.tensor([[0.0, 4.0, 1.0], [0.0, -1.0, 5.0], [7.0, 0.0, -3.0]]),
+    )
+    assert diagnostics["projection_residual_max"] == 0.0
+
+
+def test_projection_hook_matches_manual_expert_computation():
+    torch.manual_seed(4)
+    mlp = DroplessMoEMLP(d_model=4, hidden_size=3, num_experts=2)
+    x = torch.randn(3, 4)
+    counts = torch.tensor([2, 1])
+    directions = F.normalize(torch.randn(2, 4), dim=-1)
+    condition = InterventionCondition("oracle", "router", 1.0)
+
+    projected, _ = apply_grouped_projection(x, counts, directions, alpha=1.0)
+    w1 = mlp.w1.view(2, 3, 4)
+    w2 = mlp.w2.view(2, 3, 4)
+    w3 = mlp.w3.view(2, 3, 4)
+    expected_parts = []
+    start = 0
+    for expert, count in enumerate(counts.tolist()):
+        expert_x = projected[start : start + count]
+        hidden = F.silu(expert_x @ w1[expert].t()) * (expert_x @ w3[expert].t())
+        expected_parts.append(hidden @ w2[expert])
+        start += count
+    expected = torch.cat(expected_parts)
+
+    hook = GroupedProjectionHook(mlp, directions, condition, validate_manual=True)
+    with hook:
+        actual = mlp(x, counts)
+
+    torch.testing.assert_close(actual, expected)
+    assert hook.diagnostics()["manual_output_max_abs_error"] < 1e-6
+    restored = mlp(x, counts)
+    assert not torch.equal(restored, actual)
+
+
+def test_implicit_control_recovers_known_orthogonal_energy_axes():
+    # Router is e0.  The two strongest legal directions are e2 and e1.
+    router = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    w1 = torch.zeros(1, 4, 4)
+    w3 = torch.zeros(1, 4, 4)
+    w1[0] = torch.diag(torch.tensor([9.0, 2.0, 5.0, 1.0]))
+
+    directions, eigenvalues = implicit_orthogonal_eigendirections(
+        w1,
+        w3,
+        router,
+        candidate_count=2,
+        iterations=24,
+        seed=7,
+    )
+
+    assert directions.shape == (1, 2, 4)
+    assert float((directions @ router.unsqueeze(-1)).abs().max()) < 1e-5
+    torch.testing.assert_close(eigenvalues[0], torch.tensor([25.0, 4.0]), rtol=1e-3, atol=1e-3)
+    energies = quadratic_energy(directions[:, 0], w1, w3)
+    torch.testing.assert_close(energies, torch.tensor([25.0]), rtol=1e-3, atol=1e-3)
+
+
+def test_all_control_conditions_use_every_candidate_and_rank_router_effect():
+    candidates = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
+    bundle = ControlBundle(
+        router=torch.zeros(2, 4),
+        candidates=candidates,
+        candidate_eigenvalues=torch.zeros(2, 3),
+        router_quadratic_energy=torch.zeros(2),
+    )
+
+    torch.testing.assert_close(bundle.direction("candidate_1"), candidates[:, 1])
+    conditions = condition_set("all_controls", candidate_count=3)
+    assert [condition.name for condition in conditions] == [
+        "router_alpha1",
+        "candidate00_alpha1",
+        "candidate01_alpha1",
+        "candidate02_alpha1",
+    ]
+
+    baseline = {"per_sequence_ce": {"first": 0.0, "second": 0.0}}
+    layer_record = {
+        "conditions": {
+            "router_alpha1": {"per_sequence_ce": {"first": 2.0, "second": 2.0}},
+            "candidate00_alpha1": {"per_sequence_ce": {"first": 1.0, "second": 1.0}},
+            "candidate01_alpha1": {"per_sequence_ce": {"first": 3.0, "second": 3.0}},
+            "candidate02_alpha1": {"per_sequence_ce": {"first": 0.0, "second": 0.0}},
+        }
+    }
+
+    add_layer_statistics(layer_record, baseline)
+
+    comparison = layer_record["all_control_comparison"]
+    assert comparison["candidate_count"] == 3
+    assert comparison["router_rank_most_harmful_first"] == 2
+    assert comparison["router_percentile"] == 200.0 / 3.0
+    assert comparison["router_exceeds_all_controls"] is False
+    assert comparison["comparisons"]["candidate00_alpha1"]["router_minus_control_mean"] == 1.0
+
+
+def test_hf_gate_up_layout_repair_is_per_expert_transpose():
+    # E=2, D=3, H=2.  HF conversion supplies [E*D, H]; native expects [E*H, D].
+    key = "blocks.0.feed_forward_moe.experts.mlp.w1"
+    expert_major = torch.arange(12).view(2, 3, 2)
+    converted = {key: expert_major.view(6, 2)}
+    native = {key: torch.empty(4, 3)}
+
+    repaired = repair_olmoe_gate_up_layout(converted, native)
+
+    assert repaired == [key]
+    torch.testing.assert_close(converted[key].view(2, 2, 3), expert_major.transpose(1, 2))
+
+
+def test_fused_hf_experts_map_exactly_to_native_w1_w2_w3():
+    # E=2, D=3, H=2. Fused gate/up is [E, 2H, D], down is [E, D, H].
+    prefix = "model.layers.4.mlp.experts"
+    gate = torch.arange(12).view(2, 2, 3)
+    up = 100 + torch.arange(12).view(2, 2, 3)
+    down = 200 + torch.arange(12).view(2, 3, 2)
+    hf_state = {
+        f"{prefix}.gate_up_proj": torch.cat((gate, up), dim=1),
+        f"{prefix}.down_proj": down,
+        "model.embed_tokens.weight": torch.empty(1),
+    }
+    native_prefix = "blocks.4.feed_forward_moe.experts.mlp"
+    native = {
+        f"{native_prefix}.w1": torch.empty(4, 3),
+        f"{native_prefix}.w2": torch.empty(4, 3),
+        f"{native_prefix}.w3": torch.empty(4, 3),
+    }
+
+    converted = extract_fused_olmoe_expert_state(hf_state, native)
+
+    assert sorted(hf_state) == ["model.embed_tokens.weight"]
+    torch.testing.assert_close(converted[f"{native_prefix}.w1"].view(2, 2, 3), gate)
+    torch.testing.assert_close(converted[f"{native_prefix}.w3"].view(2, 2, 3), up)
+    torch.testing.assert_close(
+        converted[f"{native_prefix}.w2"].view(2, 2, 3),
+        down.transpose(1, 2),
+    )
+
+
+def test_post_attention_norm_maps_to_native_feed_forward_norm():
+    post_attention = torch.arange(3, dtype=torch.float32)
+    hf_state = {
+        "model.layers.2.input_layernorm.weight": torch.full((3,), -1.0),
+        "model.layers.2.post_attention_layernorm.weight": post_attention,
+    }
+    native = {"blocks.2.feed_forward_norm.weight": torch.empty(3)}
+
+    converted = extract_olmoe_feed_forward_norm_state(hf_state, native)
+
+    assert sorted(hf_state) == ["model.layers.2.input_layernorm.weight"]
+    torch.testing.assert_close(converted["blocks.2.feed_forward_norm.weight"], post_attention)
+
+
+def test_validation_loader_reads_standard_npy_and_raw_olmo_uint16(tmp_path):
+    expected = np.array([7, 50303, 19, 0], dtype=np.uint16)
+    npy_path = tmp_path / "standard.npy"
+    raw_path = tmp_path / "olmo-raw.npy"
+    np.save(npy_path, expected)
+    expected.tofile(raw_path)
+
+    np.testing.assert_array_equal(load_validation_token_array(npy_path), expected)
+    np.testing.assert_array_equal(load_validation_token_array(raw_path), expected)
+
+
+def test_ce_validation_tolerance_tracks_float32_reduction_length():
+    short_direct, short_aggregate = ce_validation_tolerances(32)
+    long_direct, long_aggregate = ce_validation_tolerances(256)
+
+    assert short_direct == 2e-5
+    assert long_direct == 256 * torch.finfo(torch.float32).eps
+    assert short_aggregate == long_aggregate == 2e-5
+
+
+def test_pure_torch_routing_permutation_matches_weighted_topk_sum():
+    # Three tokens, top-2 expert assignments. `indices` is the expert-sorted
+    # permutation of the six flattened assignments.
+    x = torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
+    expert_ids = torch.tensor([1, 0, 2, 1, 0, 2])
+    weights = torch.tensor([0.7, 0.3, 0.4, 0.6, 0.2, 0.8])
+    bin_ids, indices = torch.sort(expert_ids)
+    bins = torch.bincount(expert_ids, minlength=3).cumsum(0)
+
+    grouped = torch_inference_gather(x, indices, bin_ids, bins, top_k=2)
+    restored = torch_inference_scatter(grouped, indices, bin_ids, weights, bins, top_k=2)
+
+    expected = x * weights.view(3, 2).sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(restored, expected)
