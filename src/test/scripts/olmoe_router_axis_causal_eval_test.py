@@ -4,10 +4,13 @@ import torch.nn.functional as F
 
 from olmo_core.nn.moe.mlp import DroplessMoEMLP
 from scripts.olmoe_router_axis_causal_eval import (
+    ControlBundle,
     GroupedProjectionHook,
     InterventionCondition,
+    add_layer_statistics,
     apply_grouped_projection,
     ce_validation_tolerances,
+    condition_set,
     extract_fused_olmoe_expert_state,
     extract_olmoe_feed_forward_norm_state,
     implicit_orthogonal_eigendirections,
@@ -93,6 +96,44 @@ def test_implicit_control_recovers_known_orthogonal_energy_axes():
     torch.testing.assert_close(eigenvalues[0], torch.tensor([25.0, 4.0]), rtol=1e-3, atol=1e-3)
     energies = quadratic_energy(directions[:, 0], w1, w3)
     torch.testing.assert_close(energies, torch.tensor([25.0]), rtol=1e-3, atol=1e-3)
+
+
+def test_all_control_conditions_use_every_candidate_and_rank_router_effect():
+    candidates = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
+    bundle = ControlBundle(
+        router=torch.zeros(2, 4),
+        candidates=candidates,
+        candidate_eigenvalues=torch.zeros(2, 3),
+        router_quadratic_energy=torch.zeros(2),
+    )
+
+    torch.testing.assert_close(bundle.direction("candidate_1"), candidates[:, 1])
+    conditions = condition_set("all_controls", candidate_count=3)
+    assert [condition.name for condition in conditions] == [
+        "router_alpha1",
+        "candidate00_alpha1",
+        "candidate01_alpha1",
+        "candidate02_alpha1",
+    ]
+
+    baseline = {"per_sequence_ce": {"first": 0.0, "second": 0.0}}
+    layer_record = {
+        "conditions": {
+            "router_alpha1": {"per_sequence_ce": {"first": 2.0, "second": 2.0}},
+            "candidate00_alpha1": {"per_sequence_ce": {"first": 1.0, "second": 1.0}},
+            "candidate01_alpha1": {"per_sequence_ce": {"first": 3.0, "second": 3.0}},
+            "candidate02_alpha1": {"per_sequence_ce": {"first": 0.0, "second": 0.0}},
+        }
+    }
+
+    add_layer_statistics(layer_record, baseline)
+
+    comparison = layer_record["all_control_comparison"]
+    assert comparison["candidate_count"] == 3
+    assert comparison["router_rank_most_harmful_first"] == 2
+    assert comparison["router_percentile"] == 200.0 / 3.0
+    assert comparison["router_exceeds_all_controls"] is False
+    assert comparison["comparisons"]["candidate00_alpha1"]["router_minus_control_mean"] == 1.0
 
 
 def test_hf_gate_up_layout_repair_is_per_expert_transpose():

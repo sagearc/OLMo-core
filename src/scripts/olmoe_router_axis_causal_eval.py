@@ -80,6 +80,16 @@ class ControlBundle:
     calibration: dict[str, Any] | None = None
 
     def direction(self, name: str) -> torch.Tensor:
+        if name.startswith("candidate_"):
+            try:
+                index = int(name.removeprefix("candidate_"))
+            except ValueError as exc:
+                raise ValueError(f"invalid candidate direction '{name}'") from exc
+            if not 0 <= index < self.candidates.shape[1]:
+                raise IndexError(
+                    f"candidate direction {index} is outside [0, {self.candidates.shape[1]})"
+                )
+            return self.candidates[:, index]
         value = getattr(self, name)
         if not isinstance(value, torch.Tensor):
             raise TypeError(f"direction '{name}' has not been selected")
@@ -639,12 +649,26 @@ class GroupedProjectionHook:
         }
 
 
-def condition_set(name: str) -> list[InterventionCondition]:
+def condition_set(name: str, *, candidate_count: int = 0) -> list[InterventionCondition]:
     identity = InterventionCondition("identity_alpha0", "router", 0.0)
     router_05 = InterventionCondition("router_alpha0.5", "router", 0.5)
     router_10 = InterventionCondition("router_alpha1", "router", 1.0)
     matched_05 = InterventionCondition("matched_alpha0.5", "matched", 0.5)
     matched_10 = InterventionCondition("matched_alpha1", "matched", 1.0)
+    if name == "all_controls":
+        if candidate_count < 1:
+            raise ValueError("all_controls requires at least one candidate")
+        return [
+            router_10,
+            *[
+                InterventionCondition(
+                    f"candidate{index:02d}_alpha1",
+                    f"candidate_{index}",
+                    1.0,
+                )
+                for index in range(candidate_count)
+            ],
+        ]
     if name == "full":
         return [router_10, matched_10]
     smoke = [identity, router_05, router_10, matched_10]
@@ -979,6 +1003,38 @@ def add_layer_statistics(layer_record: dict[str, Any], baseline: Mapping[str, An
                 "ci95": paired_bootstrap_ci(d_values),
                 "per_sequence": d_values.tolist(),
             }
+    candidate_keys = sorted(
+        key for key in conditions if key.startswith("candidate") and key.endswith("_alpha1")
+    )
+    if "router_alpha1" in conditions and candidate_keys:
+        router = conditions["router_alpha1"]
+        router_delta = float(router["delta_ce_mean"])
+        comparisons: dict[str, Any] = {}
+        control_deltas: list[float] = []
+        for key in candidate_keys:
+            control = conditions[key]
+            control_delta = float(control["delta_ce_mean"])
+            control_deltas.append(control_delta)
+            difference = _paired_values(
+                router["per_sequence_ce"],
+                control["per_sequence_ce"],
+            )
+            comparisons[key] = {
+                "control_delta_ce_mean": control_delta,
+                "router_minus_control_mean": float(difference.mean()),
+                "router_minus_control_ci95": paired_bootstrap_ci(difference),
+            }
+        controls_more_harmful = sum(delta > router_delta for delta in control_deltas)
+        layer_record["all_control_comparison"] = {
+            "candidate_count": len(candidate_keys),
+            "router_delta_ce_mean": router_delta,
+            "router_rank_most_harmful_first": controls_more_harmful + 1,
+            "router_percentile": float(
+                100.0 * sum(delta <= router_delta for delta in control_deltas) / len(control_deltas)
+            ),
+            "router_exceeds_all_controls": controls_more_harmful == 0,
+            "comparisons": comparisons,
+        }
 
 
 def load_native_model(
@@ -1345,7 +1401,10 @@ def run_revision(args: argparse.Namespace) -> Path:
             },
             "conditions": {},
         }
-        for condition in condition_set(args.condition_set):
+        for condition in condition_set(
+            args.condition_set,
+            candidate_count=args.candidate_count,
+        ):
             print(f"layer {layer}: {condition.name}", flush=True)
             projection = GroupedProjectionHook(
                 mlp,
@@ -1713,7 +1772,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--revision", default="main")
     parser.add_argument("--layers", default="8")
     parser.add_argument(
-        "--condition-set", choices=("smoke", "pilot", "full", "final"), default="smoke"
+        "--condition-set",
+        choices=("smoke", "pilot", "full", "final", "all_controls"),
+        default="smoke",
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--output-dir", default="output/router-axis-causal-eval")
