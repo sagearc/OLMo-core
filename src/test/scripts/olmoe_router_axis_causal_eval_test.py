@@ -7,6 +7,7 @@ from scripts.olmoe_router_axis_causal_eval import (
     GroupedProjectionHook,
     InterventionCondition,
     apply_grouped_projection,
+    ce_validation_tolerances,
     extract_fused_olmoe_expert_state,
     extract_olmoe_feed_forward_norm_state,
     implicit_orthogonal_eigendirections,
@@ -159,6 +160,15 @@ def test_validation_loader_reads_standard_npy_and_raw_olmo_uint16(tmp_path):
 
     np.testing.assert_array_equal(load_validation_token_array(npy_path), expected)
     np.testing.assert_array_equal(load_validation_token_array(raw_path), expected)
+
+
+def test_ce_validation_tolerance_tracks_float32_reduction_length():
+    short_direct, short_aggregate = ce_validation_tolerances(32)
+    long_direct, long_aggregate = ce_validation_tolerances(256)
+
+    assert short_direct == 2e-5
+    assert long_direct == 256 * torch.finfo(torch.float32).eps
+    assert short_aggregate == long_aggregate == 2e-5
 
 
 def test_pure_torch_routing_permutation_matches_weighted_topk_sum():

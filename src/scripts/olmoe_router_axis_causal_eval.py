@@ -947,6 +947,18 @@ def paired_bootstrap_ci(
     return float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
 
 
+def ce_validation_tolerances(sequence_length: int) -> tuple[float, float]:
+    """
+    Bound direct CE reduction noise while keeping aggregate agreement strict.
+
+    Direct per-sequence CE reduces ``sequence_length`` float32 token losses, so
+    allow one float32 epsilon per reduced term. The native evaluator aggregate
+    is compared separately with the original strict floor.
+    """
+    direct = max(2e-5, sequence_length * torch.finfo(torch.float32).eps)
+    return direct, 2e-5
+
+
 def add_layer_statistics(layer_record: dict[str, Any], baseline: Mapping[str, Any]) -> None:
     baseline_ce = baseline["per_sequence_ce"]
     for condition in layer_record["conditions"].values():
@@ -1241,14 +1253,17 @@ def run_revision(args: argparse.Namespace) -> Path:
         route_hooks=baseline_route_hooks,
         keep_logits=strict,
     )
+    direct_ce_tolerance, aggregate_ce_tolerance = ce_validation_tolerances(args.sequence_length)
     if strict and (
-        baseline["direct_ce_max_abs_error"] > 2e-5
-        or baseline["evaluator_direct_max_abs_error"] > 2e-5
+        baseline["direct_ce_max_abs_error"] > direct_ce_tolerance
+        or baseline["evaluator_direct_max_abs_error"] > aggregate_ce_tolerance
     ):
         raise RuntimeError(
             "native evaluator CE does not match direct token CE: "
             f"{baseline['direct_ce_max_abs_error']=}, "
-            f"{baseline['evaluator_direct_max_abs_error']=}"
+            f"{direct_ce_tolerance=}, "
+            f"{baseline['evaluator_direct_max_abs_error']=}, "
+            f"{aggregate_ce_tolerance=}"
         )
     repeat_logit_floor = 0.0
     repeat_weight_floor = 0.0
@@ -1306,6 +1321,8 @@ def run_revision(args: argparse.Namespace) -> Path:
             "no_hook_repeat_routes": repeat_route_comparison,
             "logit_tolerance": logit_tolerance,
             "route_weight_tolerance": route_weight_tolerance,
+            "direct_ce_tolerance": direct_ce_tolerance,
+            "aggregate_ce_tolerance": aggregate_ce_tolerance,
         },
         "complete": False,
     }
