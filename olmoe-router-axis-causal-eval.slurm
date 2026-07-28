@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=olmoe-router-axis-eval
 #SBATCH --partition=gpu-h200-killable,gpu-b200-killable
+#SBATCH --account=gpu-research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
